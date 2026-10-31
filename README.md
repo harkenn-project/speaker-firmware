@@ -15,9 +15,13 @@ protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
    It then holds a WebSocket to Kotodama:
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.
-   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and`n     `update_firmware` (see *Updates* below).
+   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and
+     `update_firmware` (see *Updates* below).
    - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
-5. **Touch and sound.** Tap the middle to talk: a chime, then it records until you tap again or stop speaking for`n   `audio.silence_s` (default 5 s, at most 30 s), and uploads the clip to Kotodama's Recordings. Drag around the edge`n   to change the volume; the speaker's own volume wins over the config unless the volume in the config changes.`n6. **BOOT button.**
+5. **Touch and sound.** Tap the middle to talk: a chime, then it records until you tap again or stop speaking for
+   `audio.silence_s` (default 5 s, at most 30 s), and uploads the clip to Kotodama's Recordings. Drag around the edge
+   to change the volume; the speaker's own volume wins over the config unless the volume in the config changes.
+6. **BOOT button.**
    - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
    - Hold 5 s: opens Wi-Fi setup on the next boot, keeping saved networks.
    - Hold 10 s: factory reset, forgetting Wi-Fi, the token and the server URL.
@@ -35,7 +39,24 @@ python -m venv .venv
 .venv\Scripts\pio device monitor      # serial log
 ```
 
-## Updates`n`nAfter the first USB flash, update over Wi-Fi: upload `.pio/build/kotodama-speaker/firmware.bin` on Kotodama's`n*Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and`nrestarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build`nyou upload (Kotodama reads it from the image).`n`n**Releases.** Pushing a new `FW_VERSION` to main makes the Jenkins job *Release kotodama firmware*`n(`../jenkins/release-firmware.xml`) build it and publish GitLab release `v<version>` with `firmware.bin`. Each speaker`nasks Kotodama for updates once when it starts; if the latest release is newer it shows *Update available* with`n*Install* and *Dismiss* (a dismissed version isn't offered again; a newer one is).`n`nTo restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
+## Updates
+
+After the first USB flash, update over Wi-Fi: upload `.pio/build/kotodama-speaker/firmware.bin` on Kotodama's
+*Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and
+restarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build
+you upload (Kotodama reads it from the image).
+
+**Releases.** Published releases live in the public repo [ninjalife/kotodama-firmware](https://gitlab.com/ninjalife/kotodama-firmware)
+as `latest.json` plus `v<version>/firmware.bin`. After building a new `FW_VERSION`:
+
+```
+python ../tools/publish_firmware.py <kotodama-firmware clone> --push
+```
+
+Each speaker asks Kotodama for updates once when it starts; if `latest.json` names a newer version it shows
+*Update available* with *Install* and *Dismiss* (a dismissed version isn't offered again; a newer one is).
+
+To restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
 
 ## Notes
 
