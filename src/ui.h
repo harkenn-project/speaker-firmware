@@ -38,6 +38,8 @@ void loop();  // run LVGL; call from the Arduino loop
 void showMessage(const char* title, const char* detail, bool spinner = true);
 void showWifiSetup(const char* apName);
 void showAdoptionCode(const char* code, const char* host);
+// A progress bar (0-100); calling it again with the same title only updates the bar and the detail text.
+void showProgress(const char* title, const char* detail, int percent);
 
 // The configured home screen.
 void showLayout(const Theme& theme, const std::vector<Widget>& widgets, bool clock24h);

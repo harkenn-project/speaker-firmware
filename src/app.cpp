@@ -7,7 +7,10 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiMulti.h>
+#include <Update.h>
 #include <esp_mac.h>
+#include <esp_ota_ops.h>
+#include <mbedtls/sha256.h>
 #include <sys/time.h>
 
 #include <map>
@@ -93,6 +96,13 @@ volatile bool tap_requested = false;
 volatile bool status_dirty = false;
 volatile uint32_t volume_changed_at = 0;
 uint32_t status_text_until = 0;
+// Firmware update requested by Kotodama, run from the main loop
+struct FirmwareUpdate {
+  String url, version, sha256;
+  size_t size = 0;
+};
+std::unique_ptr<FirmwareUpdate> pending_update;
+
 enum class Voice { Off, Starting, Recording };
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
@@ -145,6 +155,82 @@ int upload_recording(uint8_t* wav, size_t size, const char* kind) {
   const int code = http.POST(wav, size);
   http.end();
   return code;
+}
+
+// Downloads firmware into the spare app slot and checks its SHA-256. Returns an error message, or "" on success
+// (the slot is then the one to boot next).
+String install_firmware(const FirmwareUpdate& fw) {
+  if (!fw.size || fw.sha256.length() != 64) return "bad update request";
+  auto client = make_client(fw.url);
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(15000);
+  if (!http.begin(*client, fw.url)) return "bad URL";
+  http.addHeader("Authorization", "Bearer " + token);
+  const int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return "download failed: HTTP " + String(code);
+  }
+  if (http.getSize() != static_cast<int>(fw.size)) {
+    http.end();
+    return "unexpected size " + String(http.getSize());
+  }
+  if (!Update.begin(fw.size, U_FLASH)) {
+    http.end();
+    return String("can't start: ") + Update.errorString();
+  }
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+  static uint8_t buf[4096];
+  WiFiClient* stream = http.getStreamPtr();
+  size_t done = 0;
+  int shown = -1;
+  uint32_t last_data = millis();
+  String error;
+  while (done < fw.size) {
+    const int avail = stream->available();
+    if (avail <= 0) {
+      if (!stream->connected() || millis() - last_data > 15000) {
+        error = "download interrupted";
+        break;
+      }
+      delay(2);
+      continue;
+    }
+    const size_t n = stream->readBytes(buf, min(sizeof(buf), min(static_cast<size_t>(avail), fw.size - done)));
+    if (Update.write(buf, n) != n) {
+      error = String("flash write failed: ") + Update.errorString();
+      break;
+    }
+    mbedtls_sha256_update(&sha, buf, n);
+    done += n;
+    last_data = millis();
+    const int pct = done * 100 / fw.size;
+    if (pct / 2 != shown) {  // every 2%
+      shown = pct / 2;
+      char detail[48];
+      snprintf(detail, sizeof(detail), "%s  %d%%", fw.version.c_str(), pct);
+      ui::showProgress("Updating firmware", detail, pct);
+    }
+  }
+  http.end();
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  if (error.length()) {
+    Update.abort();
+    return error;
+  }
+  char hex[65];
+  for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+  if (fw.sha256 != hex) {
+    Update.abort();
+    return "checksum mismatch";
+  }
+  if (!Update.end(true)) return String("can't finish: ") + Update.errorString();
+  return "";
 }
 
 std::shared_ptr<ui::Blob> download(const String& url) {
@@ -561,6 +647,13 @@ void handle_text(const uint8_t* payload, size_t len) {
       ui::identify();
     } else if (command == "refresh_config") {
       want_config = true;
+    } else if (command == "update_firmware") {
+      auto fw = std::unique_ptr<FirmwareUpdate>(new FirmwareUpdate());
+      fw->url = args["url"] | "";
+      fw->version = args["version"] | "?";
+      fw->sha256 = args["sha256"] | "";
+      fw->size = args["size"] | 0;
+      pending_update = std::move(fw);  // run from the main loop, not inside the socket callback
     } else if (command == "set_volume") {
       set_volume_local(args["volume"] | static_cast<int>(volume));
       audio::play(audio::Sound::Tick);
@@ -583,6 +676,8 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       ws_down_since = 0;
       first_ws_config = true;
       LOGI(TAG, "connected to Kotodama");
+      // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
+      esp_ota_mark_app_valid_cancel_rollback();
       send_settings();  // in case the volume changed while offline
       send_status();
       break;
@@ -597,6 +692,29 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
     default:
       break;
   }
+}
+
+void run_firmware_update() {
+  std::unique_ptr<FirmwareUpdate> fw = std::move(pending_update);
+  LOGI(TAG, "updating firmware %s -> %s (%u bytes)", FW_VERSION, fw->version.c_str(), fw->size);
+  flush_logs();
+  voice = Voice::Off;
+  audio::stopRecording();
+  ws.disconnect();
+  ws_connected = false;
+  ui::showProgress("Updating firmware", fw->version.c_str(), 0);
+  const String error = install_firmware(*fw);
+  if (error.length()) {
+    LOGE(TAG, "firmware update failed: %s", error.c_str());
+    audio::play(audio::Sound::Error);
+    ui::showMessage("Update failed", error.c_str(), false);
+    delay(4000);
+    return;  // run_online() starts over: reconnects and redraws the layout
+  }
+  store::setUpdatedFrom(FW_VERSION);
+  ui::showMessage("Update installed", "Restarting", true);
+  delay(800);
+  ESP.restart();
 }
 
 void update_sleep() {
@@ -662,6 +780,10 @@ bool run_online() {
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
     update_sleep();
+    if (pending_update) {
+      run_firmware_update();  // only returns if the update failed
+      return true;
+    }
     if (play_state_until && static_cast<int32_t>(millis() - play_state_until) > 0) {
       play_state_until = 0;
       ui::setState(play_state_restore.c_str());
@@ -732,6 +854,8 @@ void main_task(void*) {
   token = store::token();
   LOGI(TAG, "Kotodama speaker %s, firmware %s, server %s, %s", device_id.c_str(), FW_VERSION, server_url.c_str(),
        token.length() ? "adopted" : "not adopted");
+  const String updated_from = store::takeUpdatedFrom();
+  if (updated_from.length()) LOGI(TAG, "firmware updated from %s to %s", updated_from.c_str(), FW_VERSION);
 
   volume = store::volume(70);
   if (audio::begin()) {

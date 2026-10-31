@@ -4,7 +4,7 @@ Firmware for the Spotpear ESP32-S3 1.28" BOX: ESP32-S3 N16R8, a GC9A01 240×240 
 ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9 and LovyanGFX. It speaks the
 protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
-## What it does (v0.2)
+## What it does (v0.4)
 
 1. **Wi-Fi.** With no saved network, it opens the access point `Kotodama-XXXX`. Join it, and a page at
    `http://192.168.4.1` lets you pick a network. The page has an *Advanced* field for the server URL, which defaults
@@ -15,14 +15,14 @@ protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
    It then holds a WebSocket to Kotodama:
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.
-   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume` and `play_state`.
+   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and`n     `update_firmware` (see *Updates* below).
    - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
-5. **BOOT button.**
-   - Short press: wakes the screen.
+5. **Touch and sound.** Tap the middle to talk: a chime, then it records until you tap again or stop speaking for`n   `audio.silence_s` (default 5 s, at most 30 s), and uploads the clip to Kotodama's Recordings. Drag around the edge`n   to change the volume; the speaker's own volume wins over the config unless the volume in the config changes.`n6. **BOOT button.**
+   - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
    - Hold 5 s: opens Wi-Fi setup on the next boot, keeping saved networks.
    - Hold 10 s: factory reset, forgetting Wi-Fi, the token and the server URL.
 
-Audio is not implemented yet: no wake word, microphone streaming or playback. The amplifier stays off.
+Not yet implemented: wake word, streaming to the voice pipeline, spoken replies.
 
 ## Build and flash
 
@@ -35,7 +35,7 @@ python -m venv .venv
 .venv\Scripts\pio device monitor      # serial log
 ```
 
-To restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
+## Updates`n`nAfter the first USB flash, update over Wi-Fi: upload `.pio/build/kotodama-speaker/firmware.bin` on Kotodama's`n*Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and`nrestarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build`nyou upload (Kotodama reads it from the image).`n`nTo restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
 
 ## Notes
 

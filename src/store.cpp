@@ -123,6 +123,18 @@ void setMicMuted(bool muted) {
   prefs.putBool("muted", muted);
 }
 
+void setUpdatedFrom(const String& version) {
+  Lock l;
+  prefs.putString("ota_from", version);
+}
+
+String takeUpdatedFrom() {
+  Lock l;
+  const String v = get("ota_from", "");
+  if (v.length()) prefs.remove("ota_from");
+  return v;
+}
+
 void requestPortal() {
   Lock l;
   prefs.putBool("portal", true);

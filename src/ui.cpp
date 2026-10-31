@@ -30,6 +30,9 @@ lv_timer_t* clock_timer = nullptr;
 lv_obj_t* flash = nullptr;
 lv_timer_t* flash_timer = nullptr;
 bool muted = false;
+lv_obj_t* progress_bar = nullptr;
+lv_obj_t* progress_detail = nullptr;
+String progress_title;
 
 // Touch: a transparent layer on top of the home screen, and the volume arc it shows.
 constexpr int EDGE_RADIUS = 80;             // touches starting farther than this from the centre adjust the volume
@@ -187,6 +190,8 @@ lv_obj_t* reset_screen() {
   lv_obj_clean(scr);
   ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
   touch_layer = volume_arc = volume_label = nullptr;
+  progress_bar = progress_detail = nullptr;
+  progress_title = "";
   if (flash_timer) {
     lv_timer_delete(flash_timer);
     flash_timer = nullptr;
@@ -430,6 +435,24 @@ void showAdoptionCode(const char* code, const char* host) {
   lv_obj_set_style_text_letter_space(c, 8, 0);
   label(scr, "Enter it in Kotodama", &lv_font_montserrat_14, theme.muted, 30, 150, 180, 20);
   label(scr, host, &lv_font_montserrat_14, theme.muted, 20, 170, 200, 20);
+}
+
+void showProgress(const char* title, const char* detail, int percent) {
+  Lock l;
+  if (!progress_bar || progress_title != title) {
+    lv_obj_t* scr = reset_screen();
+    progress_title = title;
+    label(scr, title, &lv_font_montserrat_18, theme.text, 26, 78, 188, 24);
+    progress_bar = lv_bar_create(scr);
+    lv_obj_set_size(progress_bar, 160, 14);
+    lv_obj_set_pos(progress_bar, 40, 114);
+    lv_bar_set_range(progress_bar, 0, 100);
+    lv_obj_set_style_bg_color(progress_bar, color(theme.surface), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(progress_bar, color(theme.primary), LV_PART_INDICATOR);
+    progress_detail = label(scr, "", &lv_font_montserrat_14, theme.muted, 30, 138, 180, 20);
+  }
+  lv_bar_set_value(progress_bar, constrain(percent, 0, 100), LV_ANIM_OFF);
+  lv_label_set_text(progress_detail, detail);
 }
 
 void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24h) {

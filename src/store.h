@@ -34,6 +34,10 @@ void setConfigVolume(int volume);
 bool micMuted();
 void setMicMuted(bool muted);
 
+// The firmware version installed before an over-the-air update, reported once after the restart.
+void setUpdatedFrom(const String& version);
+String takeUpdatedFrom();  // empty if there was no update
+
 // Ask for the Wi-Fi setup portal on the next boot (saved networks are kept).
 void requestPortal();
 bool takePortalRequest();  // true once after requestPortal()
