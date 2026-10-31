@@ -1,4 +1,4 @@
-// Logging: prints to the USB console and queues lines for upload to Kotodama.
+// Logging: prints to the USB console and queues lines for upload to Harkenn.
 // ESP-IDF's own log output (Wi-Fi, TLS, ...) is captured too.
 #pragma once
 #include <ArduinoJson.h>

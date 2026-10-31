@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <WebSocketsClient.h>
 #include <WiFi.h>
@@ -13,8 +14,10 @@
 #include <mbedtls/sha256.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
+#include <vector>
 
 #include "audio.h"
 #include "board.h"
@@ -33,7 +36,7 @@ constexpr uint32_t LOG_FLUSH_MS = 2000;
 constexpr uint32_t WS_GIVE_UP_MS = 30000;  // then re-check the token over HTTP
 constexpr size_t MAX_ASSET_BYTES = 3 * 1024 * 1024;
 constexpr uint32_t MAX_LISTEN_MS = 30000;
-constexpr uint32_t REPLY_TIMEOUT_MS = 60000;  // the first answer can be slow while Kotodama loads its models
+constexpr uint32_t REPLY_TIMEOUT_MS = 60000;  // the first answer can be slow while Harkenn loads its models
 constexpr uint32_t CHIME_MS = 350;          // start listening after the activation chime, so it isn't sent
 constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
 
@@ -97,7 +100,7 @@ volatile bool tap_requested = false;
 volatile bool status_dirty = false;
 volatile uint32_t volume_changed_at = 0;
 uint32_t status_text_until = 0;
-// Firmware update requested by Kotodama, run from the main loop
+// Firmware update requested by Harkenn, run from the main loop
 struct FirmwareUpdate {
   String url, version, sha256;
   size_t size = 0;
@@ -105,7 +108,7 @@ struct FirmwareUpdate {
 std::unique_ptr<FirmwareUpdate> pending_update;
 std::unique_ptr<FirmwareUpdate> offered_update;  // shown on screen as "Update available"
 volatile bool offer_install = false, offer_dismiss = false;
-bool update_checked = false;  // asked Kotodama for updates since boot
+bool update_checked = false;  // asked Harkenn for updates since boot
 
 enum class Voice { Off, Starting, Listening, Waiting, Speaking };
 Voice voice = Voice::Off;
@@ -116,7 +119,7 @@ size_t speech_dropped = 0;
 String ap_name() {
   String suffix = device_id.substring(8);
   suffix.toUpperCase();
-  return "Kotodama-" + suffix;
+  return "Harkenn-" + suffix;
 }
 
 std::unique_ptr<WiFiClient> make_client(const String& url) {
@@ -281,7 +284,7 @@ void connect_wifi() {
   const auto networks = store::wifiNetworks();
   if (networks.empty()) portal::run(ap_name());
   ui::showMessage("Connecting to Wi-Fi", networks.front().ssid.c_str());
-  WiFi.setHostname(("kotodama-" + device_id.substring(8)).c_str());
+  WiFi.setHostname(("harkenn-" + device_id.substring(8)).c_str());
   WiFi.mode(WIFI_STA);
   int attempts = 0;
   while (wifi->run(10000) != WL_CONNECTED) {
@@ -292,28 +295,59 @@ void connect_wifi() {
   }
   LOGI(TAG, "Wi-Fi: %s, IP %s, RSSI %d", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   configTzTime(timezone.c_str(), "pool.ntp.org", "time.google.com");
+  MDNS.begin(("harkenn-" + device_id.substring(8)).c_str());  // for finding the server
 }
 
 // Server discovery and adoption
 
+// Where the server might be, in the order tried (docs/PROTOCOL.md, "Finding the server").
+std::vector<String> server_candidates() {
+  std::vector<String> out;
+  auto add = [&out](const String& url) {
+    if (url.length() && std::find(out.begin(), out.end(), url) == out.end()) out.push_back(url);
+  };
+  add(store::serverUrl());
+  const int found = MDNS.queryService("harkenn", "tcp");
+  for (int i = 0; i < found; i++) {
+    add(MDNS.txt(i, "url"));
+    add("http://" + MDNS.address(i).toString() + ":" + String(MDNS.port(i)));
+  }
+  const IPAddress local = MDNS.queryHost("harkenn", 1500);
+  if (local != IPAddress()) add("http://" + local.toString() + ":8000");
+  add("http://harkenn");  // a DNS name you can point at the server when mDNS doesn't reach the speaker
+  add("http://harkenn:8000");
+  return out;
+}
+
+// Pings server_url; true if a Harkenn server answers. Sets the clock from its reply.
+bool ping_server() {
+  String body;
+  const int code = request("GET", "/api/v1/ping", "", &body, false);
+  JsonDocument doc;
+  if (code != 200 || deserializeJson(doc, body)) return false;
+  const String name = doc["server"] | "";
+  if (name != "harkenn" && name != "kotodama") return false;  // some other web server answering on that name
+  const double t = doc["time"] | 0.0;
+  if (time(nullptr) < 1700000000 && t > 1.7e9) {  // set the clock now rather than waiting for NTP
+    timeval tv{static_cast<time_t>(t), 0};
+    settimeofday(&tv, nullptr);
+  }
+  return true;
+}
+
 bool find_server() {
-  ui::showMessage("Looking for Kotodama", server.host.c_str());
+  ui::showMessage("Looking for Harkenn", "On this network");
   while (WiFi.status() == WL_CONNECTED) {
-    String body;
-    const int code = request("GET", "/api/v1/ping", "", &body, false);
-    if (code == 200) {
-      JsonDocument doc;
-      if (!deserializeJson(doc, body) && time(nullptr) < 1700000000) {
-        const double t = doc["time"] | 0.0;  // set the clock now rather than waiting for NTP
-        if (t > 1.7e9) {
-          timeval tv{static_cast<time_t>(t), 0};
-          settimeofday(&tv, nullptr);
-        }
+    for (const String& url : server_candidates()) {
+      server_url = url;
+      server = parse_url(url);
+      if (ping_server()) {
+        LOGI(TAG, "found Harkenn at %s", server_url.c_str());
+        return true;
       }
-      LOGI(TAG, "found Kotodama at %s", server_url.c_str());
-      return true;
     }
-    LOGW(TAG, "ping %s: %d", server_url.c_str(), code);
+    LOGW(TAG, "no Harkenn server found yet");
+    ui::showMessage("Looking for Harkenn", "Set its address on the Wi-Fi setup page if this takes long", true);
     delay(3000);
   }
   return false;
@@ -358,6 +392,7 @@ bool adopt() {
     if (state == "approved") {
       token = st["token"] | "";
       store::setToken(token);
+      store::setServerUrl(server_url);  // the server that adopted us, tried first from now on
       LOGI(TAG, "adopted");
       ui::showMessage("Adopted!", "Loading settings");
       return true;
@@ -466,6 +501,12 @@ void apply_config(JsonDocument& doc) {
   board::markActivity();
   board::setBrightness(brightness);
   config_version = doc["version"] | 0;
+  // Where the server says it lives: saved so the speaker finds it again (e.g. after the server moves).
+  const String home = doc["server_url"] | "";
+  if ((home.startsWith("http://") || home.startsWith("https://")) && home != store::serverUrl()) {
+    store::setServerUrl(home);
+    LOGI(TAG, "server address saved: %s", home.c_str());
+  }
   applied_key = config_key(doc);
   LOGI(TAG, "applied config v%d (layout %s, character %s)", config_version, (const char*)(doc["layout"]["id"] | "?"),
        (const char*)(doc["character"]["id"] | "?"));
@@ -502,7 +543,7 @@ void send_status() {
   send_json(doc);
 }
 
-// Tells Kotodama about settings changed on the speaker, so its stored config matches.
+// Tells Harkenn about settings changed on the speaker, so its stored config matches.
 void send_settings() {
   if (!ws_connected) return;
   JsonDocument doc;
@@ -517,7 +558,7 @@ void set_volume_local(int v) {
   volume_changed_at = millis();
 }
 
-// Voice: a tap starts listening. What the mic hears streams to Kotodama, which answers with speech (docs/PROTOCOL.md).
+// Voice: a tap starts listening. What the mic hears streams to Harkenn, which answers with speech (docs/PROTOCOL.md).
 
 void flash_state(const char* state, uint32_t ms) {
   if (!play_state_until) play_state_restore = "idle";
@@ -617,9 +658,9 @@ void handle_tap() {
   }
 }
 
-// Messages from Kotodama about the current utterance.
+// Messages from Harkenn about the current utterance.
 void handle_voice_message(const String& type, JsonDocument& doc) {
-  if (type == "speak_start") {  // a reply, or something Kotodama wants said (admin "Say it")
+  if (type == "speak_start") {  // a reply, or something Harkenn wants said (admin "Say it")
     audio::startSpeech();
     speech_dropped = 0;
     voice = Voice::Speaking;
@@ -641,7 +682,7 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
       LOGI(TAG, "heard \"%s\"", heard.c_str());
     }
   } else if (type == "voice_error" && (voice == Voice::Waiting || voice == Voice::Listening)) {
-    voice_failed((doc["message"] | "Kotodama couldn't answer"));
+    voice_failed((doc["message"] | "Harkenn couldn't answer"));
   }
 }
 void update_voice() {
@@ -660,7 +701,7 @@ void update_voice() {
     else voice_failed("connection lost while listening");
   } else if (voice == Voice::Waiting && static_cast<int32_t>(millis() - voice_at) >= 0) {
     send_voice("voice_cancel");
-    voice_failed("no answer from Kotodama");
+    voice_failed("no answer from Harkenn");
   } else if (voice == Voice::Speaking && !audio::speaking()) {
     voice_done();
   }  if (status_text_until && static_cast<int32_t>(millis() - status_text_until) >= 0) {
@@ -753,7 +794,7 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       ws_connected = true;
       ws_down_since = 0;
       first_ws_config = true;
-      LOGI(TAG, "connected to Kotodama");
+      LOGI(TAG, "connected to Harkenn");
       // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
       esp_ota_mark_app_valid_cancel_rollback();
       send_settings();  // in case the volume changed while offline
@@ -764,7 +805,7 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       }
       break;
     case WStype_DISCONNECTED:
-      if (ws_connected) LOGW(TAG, "connection to Kotodama lost");
+      if (ws_connected) LOGW(TAG, "connection to Harkenn lost");
       ws_connected = false;
       if (voice == Voice::Speaking) audio::endSpeech();  // play what arrived
       if (!ws_down_since) ws_down_since = millis();
@@ -948,7 +989,7 @@ void main_task(void*) {
   server_url = store::serverUrl();
   server = parse_url(server_url);
   token = store::token();
-  LOGI(TAG, "Kotodama speaker %s, firmware %s, server %s, %s", device_id.c_str(), FW_VERSION, server_url.c_str(),
+  LOGI(TAG, "Harkenn speaker %s, firmware %s, server %s, %s", device_id.c_str(), FW_VERSION, server_url.c_str(),
        token.length() ? "adopted" : "not adopted");
   const String updated_from = store::takeUpdatedFrom();
   if (updated_from.length()) LOGI(TAG, "firmware updated from %s to %s", updated_from.c_str(), FW_VERSION);
@@ -990,7 +1031,7 @@ void main_task(void*) {
 }  // namespace
 
 void start() {
-  xTaskCreatePinnedToCore(main_task, "kotodama", 20480, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(main_task, "harkenn", 20480, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(button_task, "button", 4096, nullptr, 1, nullptr, 1);
 }
 

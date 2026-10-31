@@ -13,8 +13,8 @@ constexpr size_t MAX_WIFI = 8;
 
 void begin();
 
-String serverUrl();  // defaults to KOTODAMA_SERVER_URL
-void setServerUrl(const String& url);
+String serverUrl();  // saved server URL, or empty: the speaker then looks for its server (app.cpp)
+void setServerUrl(const String& url);  // empty forgets it
 
 String token();
 void setToken(const String& token);

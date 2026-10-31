@@ -1,5 +1,5 @@
 // Wi-Fi setup portal: an open access point with a captive page for choosing the network (and, if needed, the
-// Kotodama server URL). Saves to NVS and restarts.
+// Harkenn server URL). Saves to NVS and restarts.
 #include "portal.h"
 
 #include <DNSServer.h>
@@ -29,7 +29,7 @@ String html_escape(const String& s) {
 }
 
 const char PAGE_HEAD[] PROGMEM = R"(<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Kotodama speaker setup</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Harkenn speaker setup</title>
 <style>body{font:16px system-ui,sans-serif;background:#0e1220;color:#e6e9f5;margin:0;padding:24px}
 form{max-width:420px;margin:auto;display:grid;gap:14px}label{display:grid;gap:4px;color:#8d94b3}
 input,select,button{font:inherit;padding:10px;border-radius:8px;border:1px solid #2a3150;background:#171c2f;color:inherit}
@@ -60,11 +60,11 @@ void run(const String& apName) {
 
   server.on("/", HTTP_GET, [&]() {
     String page = FPSTR(PAGE_HEAD);
-    page += "<form method=post action=/save><h2>Kotodama speaker</h2>";
+    page += "<form method=post action=/save><h2>Harkenn speaker</h2>";
     page += "<label>Network<select name=ssid><option value=''>Other (type below)</option>" + options + "</select></label>";
     page += "<label>Other network name<input name=other maxlength=32></label>";
     page += "<label>Password<input name=password type=password maxlength=64></label>";
-    page += "<details><summary>Advanced</summary><label>Kotodama server<input name=server value=\"" +
+    page += "<details><summary>Advanced</summary><label>Harkenn server<input name=server placeholder=\"Found automatically\" value=\"" +
             html_escape(store::serverUrl()) + "\"></label></details>";
     page += "<button>Save and connect</button></form></body></html>";
     server.send(200, "text/html", page);
@@ -84,7 +84,9 @@ void run(const String& apName) {
       return;
     }
     store::upsertWifi(ssid, password);
-    if (serverUrl.startsWith("http://") || serverUrl.startsWith("https://")) store::setServerUrl(serverUrl);
+    if (!serverUrl.length() || serverUrl.startsWith("http://") || serverUrl.startsWith("https://")) {
+      store::setServerUrl(serverUrl);  // empty: find the server on the network
+    }
     LOGI("portal", "saved network %s", ssid.c_str());
     server.send(200, "text/html", String(FPSTR(PAGE_HEAD)) + "<p>Saved. The speaker is restarting and will join " +
                                       html_escape(ssid) + ".</p></body></html>");

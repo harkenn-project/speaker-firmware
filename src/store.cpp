@@ -15,7 +15,7 @@ struct Lock {
 
 void begin() {
   mutex = xSemaphoreCreateMutex();
-  prefs.begin("kotodama", false);
+  prefs.begin("kotodama", false);  // the project's old name: kept so saved settings survive
 }
 
 // Preferences logs an error for every missing key, so check first.
@@ -23,9 +23,13 @@ String get(const char* key, const char* fallback) {
   return prefs.isKey(key) ? prefs.getString(key, fallback) : String(fallback);
 }
 
+// Firmware before 0.7 had this server built in and didn't save it, so a speaker adopted then implies it.
+constexpr const char* PRE_07_SERVER_URL = "https://kotodama.mylife.ninja";
+
 String serverUrl() {
   Lock l;
-  String url = get("server", KOTODAMA_SERVER_URL);
+  const bool adopted_before_07 = !prefs.isKey("server") && prefs.isKey("token");
+  String url = get("server", adopted_before_07 ? PRE_07_SERVER_URL : "");
   url.trim();
   while (url.endsWith("/")) url.remove(url.length() - 1);
   return url;
@@ -33,7 +37,8 @@ String serverUrl() {
 
 void setServerUrl(const String& url) {
   Lock l;
-  prefs.putString("server", url);
+  if (url.length()) prefs.putString("server", url);
+  else if (prefs.isKey("server")) prefs.remove("server");
 }
 
 String token() {

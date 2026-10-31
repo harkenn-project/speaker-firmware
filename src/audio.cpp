@@ -165,8 +165,8 @@ void render(const Note* notes) {
   }
 }
 
-// Speech from Kotodama: PCM written by the main task into a PSRAM stream buffer, played by the play task.
-constexpr size_t SPEECH_BUFFER_BYTES = 512 * 1024;  // 16 s; Kotodama stays at most 3 s ahead
+// Speech from Harkenn: PCM written by the main task into a PSRAM stream buffer, played by the play task.
+constexpr size_t SPEECH_BUFFER_BYTES = 512 * 1024;  // 16 s; Harkenn stays at most 3 s ahead
 StreamBufferHandle_t speech = nullptr;
 volatile bool speech_on = false, speech_ending = false;
 

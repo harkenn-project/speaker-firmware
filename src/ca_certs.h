@@ -1,5 +1,5 @@
 // Let's Encrypt root certificates (ISRG Root X1 RSA, ISRG Root X2 ECDSA), from https://letsencrypt.org/certificates/
-// kotodama.mylife.ninja is served with a Let's Encrypt certificate by the cluster gateway.
+// For servers reached over https with a Let's Encrypt certificate.
 // Regenerate with tools/make_ca_header.py.
 #pragma once
 

@@ -37,7 +37,7 @@ struct ListenInfo {
 };
 ListenInfo listenInfo();  // about the current or last listening session
 
-// Speech from Kotodama (16 kHz, 16-bit mono): startSpeech(), writeSpeech() as it arrives, endSpeech() when all is
+// Speech from Harkenn (16 kHz, 16-bit mono): startSpeech(), writeSpeech() as it arrives, endSpeech() when all is
 // sent. speaking() stays true until it has been played. stopSpeech() cuts it off.
 void startSpeech();
 size_t writeSpeech(const uint8_t* pcm, size_t bytes);  // returns bytes accepted (the rest didn't fit)

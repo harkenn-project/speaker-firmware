@@ -58,7 +58,7 @@ struct Gesture {
 
 lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
 
-// KANI animation player (format: kotodama/app/kani.py). Frames are decoded into one RGB565 frame buffer in PSRAM
+// KANI animation player (format: app/kani.py in harkenn-dockerserver). Frames are decoded into one RGB565 frame buffer in PSRAM
 // that an lv_image displays; frame 0 is complete, later frames only carry changed pixels.
 
 uint16_t rd16(const uint8_t* p) { return p[0] | p[1] << 8; }
@@ -485,7 +485,7 @@ void showAdoptionCode(const char* code, const char* host) {
   label(scr, "Adoption code", &lv_font_montserrat_18, theme.text, 30, 48, 180, 24);
   lv_obj_t* c = label(scr, code, &lv_font_montserrat_48, theme.primary, 20, 82, 200, 64);
   lv_obj_set_style_text_letter_space(c, 8, 0);
-  label(scr, "Enter it in Kotodama", &lv_font_montserrat_14, theme.muted, 30, 150, 180, 20);
+  label(scr, "Enter it in Harkenn", &lv_font_montserrat_14, theme.muted, 30, 150, 180, 20);
   label(scr, host, &lv_font_montserrat_14, theme.muted, 20, 170, 200, 20);
 }
 
