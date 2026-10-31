@@ -107,7 +107,7 @@ namespace board {
 
 void begin() {
   pinMode(pins::AMP_EN, OUTPUT);
-  digitalWrite(pins::AMP_EN, LOW);  // speaker amp off until audio is implemented
+  digitalWrite(pins::AMP_EN, LOW);  // speaker amp off; audio.cpp switches it on while playing
   pinMode(pins::BOOT_BUTTON, INPUT_PULLUP);
   pinMode(pins::CHARGE_STATUS, INPUT_PULLUP);
   analogReadResolution(12);

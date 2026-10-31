@@ -93,6 +93,36 @@ bool upsertWifi(const String& ssid, const String& password) {
   return true;
 }
 
+int volume(int fallback) {
+  Lock l;
+  return prefs.isKey("volume") ? prefs.getChar("volume", fallback) : fallback;
+}
+
+void setVolume(int volume) {
+  Lock l;
+  prefs.putChar("volume", volume);
+}
+
+int configVolume() {
+  Lock l;
+  return prefs.isKey("cfg_vol") ? prefs.getChar("cfg_vol", -1) : -1;
+}
+
+void setConfigVolume(int volume) {
+  Lock l;
+  prefs.putChar("cfg_vol", volume);
+}
+
+bool micMuted() {
+  Lock l;
+  return prefs.isKey("muted") && prefs.getBool("muted", false);
+}
+
+void setMicMuted(bool muted) {
+  Lock l;
+  prefs.putBool("muted", muted);
+}
+
 void requestPortal() {
   Lock l;
   prefs.putBool("portal", true);

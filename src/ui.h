@@ -9,11 +9,11 @@
 namespace ui {
 
 // Character states, in the order used by CharacterSet.
-constexpr const char* STATES[] = {"idle", "listening", "thinking", "speaking", "sleeping", "error"};
-constexpr size_t STATE_COUNT = 6;
+constexpr const char* STATES[] = {"idle", "listening", "thinking", "speaking", "sleeping", "error", "muted"};
+constexpr size_t STATE_COUNT = 7;
 int stateIndex(const char* state);  // -1 if unknown
 
-struct Blob {  // a GIF file held in PSRAM
+struct Blob {  // a downloaded file (KANI animation) held in PSRAM
   uint8_t* data = nullptr;
   size_t size = 0;
   ~Blob();
@@ -46,5 +46,13 @@ void setState(const char* state);
 const char* state();
 void setStatusText(const char* text);  // empty = default text for the state
 void identify();                       // blink the screen for a few seconds
+
+// Mic muted: while idle or sleeping, the character shows its muted animation and the ring turns orange.
+void setMuted(bool muted);
+
+// Touch on the home screen. A tap in the middle calls `on_tap`; dragging around the edge turns the volume up
+// (clockwise) or down, calling `on_volume` with the change in percent, which returns the new volume to display.
+// Both run on the UI task with the UI locked: keep them short.
+void onTouch(void (*on_tap)(), int (*on_volume)(int delta));
 
 }  // namespace ui

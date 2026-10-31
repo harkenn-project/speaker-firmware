@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 
+#include "audio.h"
 #include "board.h"
 #include "ca_certs.h"
 #include "logbuf.h"
@@ -28,6 +29,9 @@ constexpr uint32_t STATUS_INTERVAL_MS = 30000;
 constexpr uint32_t LOG_FLUSH_MS = 2000;
 constexpr uint32_t WS_GIVE_UP_MS = 30000;  // then re-check the token over HTTP
 constexpr size_t MAX_ASSET_BYTES = 3 * 1024 * 1024;
+constexpr uint32_t MAX_RECORD_MS = 8000;
+constexpr uint32_t CHIME_MS = 350;          // start recording after the activation chime, so it isn't recorded
+constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
 
 struct ServerUrl {
   bool secure = true;
@@ -66,7 +70,7 @@ WiFiMulti* wifi = nullptr;
 // Applied configuration
 int config_version = 0;
 int brightness = 75;
-int volume = 70;
+volatile int volume = 70;
 uint32_t sleep_after_ms = 300000;
 bool dimmed = false;
 std::map<String, std::shared_ptr<ui::Blob>> blobs;  // animations by URL, so unchanged ones aren't downloaded again
@@ -82,6 +86,15 @@ bool want_config = false;
 uint32_t last_status = 0, last_log_flush = 0;
 String play_state_restore;
 uint32_t play_state_until = 0;
+
+// Touch, button and voice
+volatile bool tap_requested = false;
+volatile bool status_dirty = false;
+volatile uint32_t volume_changed_at = 0;
+uint32_t status_text_until = 0;
+enum class Voice { Off, Starting, Recording };
+Voice voice = Voice::Off;
+uint32_t voice_at = 0;
 
 String ap_name() {
   String suffix = device_id.substring(8);
@@ -115,6 +128,20 @@ int request(const char* method, const String& path, const String& body, String* 
     code = http.GET();
   }
   if (code > 0 && response) *response = http.getString();
+  http.end();
+  return code;
+}
+
+int upload_recording(uint8_t* wav, size_t size, const char* kind) {
+  const String url = server_url + "/api/v1/device/recordings?kind=" + kind;
+  auto client = make_client(url);
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(20000);
+  if (!http.begin(*client, url)) return -1;
+  http.addHeader("Authorization", "Bearer " + token);
+  http.addHeader("Content-Type", "audio/wav");
+  const int code = http.POST(wav, size);
   http.end();
   return code;
 }
@@ -328,7 +355,14 @@ void apply_config(JsonDocument& doc) {
 
   brightness = display["brightness"] | 75;
   sleep_after_ms = static_cast<uint32_t>(display["sleep_after_s"] | 300) * 1000;
-  volume = cfg["audio"]["volume"] | 70;
+  // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
+  const int config_volume = constrain(cfg["audio"]["volume"] | 70, 0, 100);
+  if (config_volume != store::configVolume()) {
+    store::setConfigVolume(config_volume);
+    volume = config_volume;
+    store::setVolume(volume);
+    audio::setVolume(volume);
+  }
   timezone = cfg["timezone"] | "UTC0";
   setenv("TZ", timezone.c_str(), 1);
   tzset();
@@ -382,9 +416,115 @@ void send_status() {
   s["battery"] = board::batteryPercent();
   s["charging"] = board::charging();
   s["volume"] = volume;
+  s["muted"] = audio::micMuted();
   s["brightness"] = brightness;
   s["config_version"] = config_version;
   send_json(doc);
+}
+
+// Tells Kotodama about settings changed on the speaker, so its stored config matches.
+void send_settings() {
+  if (!ws_connected) return;
+  JsonDocument doc;
+  doc["type"] = "settings";
+  doc["volume"] = volume;
+  send_json(doc);
+}
+
+void set_volume_local(int v) {
+  volume = constrain(v, 0, 100);
+  audio::setVolume(volume);
+  volume_changed_at = millis();
+}
+
+// Voice: a tap starts listening; for now the recording is uploaded to Kotodama (Recordings in the admin UI).
+
+void flash_state(const char* state, uint32_t ms) {
+  if (!play_state_until) play_state_restore = "idle";
+  ui::setState(state);
+  play_state_until = millis() + ms;
+}
+
+void show_status_text(const char* text, uint32_t ms) {
+  ui::setStatusText(text);
+  status_text_until = millis() + ms;
+}
+
+void finish_voice() {
+  voice = Voice::Off;
+  size_t size = 0;
+  uint32_t ms = 0;
+  int peak = 0;
+  uint8_t* wav = audio::takeRecordingWav(&size, &ms, &peak);
+  if (!wav || audio::micMuted()) {  // muted mid-recording: throw it away
+    if (wav) heap_caps_free(wav);
+    ui::setState("idle");
+    return;
+  }
+  audio::play(audio::Sound::Done);
+  ui::setState("thinking");
+  const int code = upload_recording(wav, size, "utterance");
+  heap_caps_free(wav);
+  LOGI(TAG, "recorded %u ms, peak %d%%, upload HTTP %d", ms, peak, code);
+  if (code == 201) {
+    ui::setState("idle");
+  } else {
+    audio::play(audio::Sound::Error);
+    flash_state("error", 3000);
+  }
+}
+
+void handle_tap() {
+  if (voice == Voice::Recording) {
+    audio::stopRecording();  // finish_voice() picks it up
+  } else if (voice == Voice::Starting) {
+    voice = Voice::Off;
+    audio::play(audio::Sound::Cancel);
+    ui::setState("idle");
+  } else if (audio::micMuted()) {
+    audio::play(audio::Sound::Cancel);
+    show_status_text("Mic is off", 2500);
+  } else if (strcmp(ui::state(), "idle") == 0 || strcmp(ui::state(), "sleeping") == 0) {
+    audio::play(audio::Sound::Activate);
+    ui::setState("listening");
+    voice = Voice::Starting;
+    voice_at = millis() + CHIME_MS;
+  }
+}
+
+void update_voice() {
+  if (tap_requested) {
+    tap_requested = false;
+    handle_tap();
+  }
+  if (voice == Voice::Starting && audio::micMuted()) {  // muted before recording began
+    voice = Voice::Off;
+    ui::setState("idle");
+  } else if (voice == Voice::Starting && static_cast<int32_t>(millis() - voice_at) >= 0) {
+    if (audio::startRecording(MAX_RECORD_MS)) {
+      voice = Voice::Recording;
+    } else {
+      voice = Voice::Off;
+      audio::play(audio::Sound::Error);
+      flash_state("error", 3000);
+    }
+  } else if (voice == Voice::Recording && !audio::recording()) {
+    finish_voice();
+  }
+  if (status_text_until && static_cast<int32_t>(millis() - status_text_until) >= 0) {
+    status_text_until = 0;
+    ui::setStatusText("");
+  }
+  if (volume_changed_at && millis() - volume_changed_at > VOLUME_SETTLE_MS) {
+    volume_changed_at = 0;
+    store::setVolume(volume);
+    send_settings();
+    send_status();
+  }
+  if (status_dirty) {
+    status_dirty = false;
+    send_status();
+  }
 }
 
 void flush_logs() {
@@ -416,8 +556,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     } else if (command == "refresh_config") {
       want_config = true;
     } else if (command == "set_volume") {
-      volume = constrain(args["volume"] | volume, 0, 100);
-      send_status();
+      set_volume_local(args["volume"] | static_cast<int>(volume));
+      audio::play(audio::Sound::Tick);
     } else if (command == "play_state") {
       const String state = args["state"] | "idle";
       if (ui::stateIndex(state.c_str()) >= 0) {
@@ -437,6 +577,7 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       ws_down_since = 0;
       first_ws_config = true;
       LOGI(TAG, "connected to Kotodama");
+      send_settings();  // in case the volume changed while offline
       send_status();
       break;
     case WStype_DISCONNECTED:
@@ -513,6 +654,7 @@ bool run_online() {
     }
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
+    update_voice();
     update_sleep();
     if (play_state_until && static_cast<int32_t>(millis() - play_state_until) > 0) {
       play_state_until = 0;
@@ -532,7 +674,17 @@ bool run_online() {
   }
 }
 
-// BOOT button: hold 5 s for Wi-Fi setup, 10 s for a factory reset. A short press wakes the screen.
+void toggle_mic() {
+  const bool muted = !audio::micMuted();
+  audio::setMicMuted(muted);
+  store::setMicMuted(muted);
+  ui::setMuted(muted);
+  audio::play(muted ? audio::Sound::MuteOn : audio::Sound::MuteOff);
+  LOGI(TAG, "mic %s", muted ? "muted" : "on");
+  status_dirty = true;
+}
+
+// BOOT button: a short press mutes or unmutes the mic. Hold 5 s for Wi-Fi setup, 10 s for a factory reset.
 void button_task(void*) {
   uint32_t down_at = 0;
   int stage = 0;
@@ -555,6 +707,7 @@ void button_task(void*) {
         store::factoryReset();
         ESP.restart();
       }
+      if (millis() - down_at < 1000) toggle_mic();
       board::markActivity();
       down_at = 0;
     }
@@ -573,6 +726,21 @@ void main_task(void*) {
   token = store::token();
   LOGI(TAG, "Kotodama speaker %s, firmware %s, server %s, %s", device_id.c_str(), FW_VERSION, server_url.c_str(),
        token.length() ? "adopted" : "not adopted");
+
+  volume = store::volume(70);
+  if (audio::begin()) {
+    audio::setVolume(volume);
+    audio::setMicMuted(store::micMuted());
+    audio::play(audio::Sound::Boot);
+  }
+  ui::setMuted(audio::micMuted());
+  ui::onTouch([] { tap_requested = true; },
+              [](int delta) {
+                const int before = volume;
+                set_volume_local(before + delta);
+                if (volume / 5 != before / 5) audio::play(audio::Sound::Tick);
+                return static_cast<int>(volume);
+              });
 
   ui::showMessage("Starting", ap_name().c_str());
   board::setBrightness(brightness);

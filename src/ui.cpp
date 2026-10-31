@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <lvgl.h>
+#include <math.h>
 #include <time.h>
 
 #include "board.h"
@@ -28,6 +29,25 @@ lv_obj_t* status_label = nullptr;
 lv_timer_t* clock_timer = nullptr;
 lv_obj_t* flash = nullptr;
 lv_timer_t* flash_timer = nullptr;
+bool muted = false;
+
+// Touch: a transparent layer on top of the home screen, and the volume arc it shows.
+constexpr int EDGE_RADIUS = 80;             // touches starting farther than this from the centre adjust the volume
+constexpr float DEGREES_PER_PERCENT = 2.7f;  // the whole 270-degree arc is 100%
+constexpr uint32_t VOLUME_HIDE_MS = 1500;
+lv_obj_t* touch_layer = nullptr;
+lv_obj_t* volume_arc = nullptr;
+lv_obj_t* volume_label = nullptr;
+lv_timer_t* volume_timer = nullptr;
+void (*tap_cb)() = nullptr;
+int (*volume_cb)(int) = nullptr;
+
+struct Gesture {
+  bool edge = false, dragging = false, cancelled = false;
+  lv_point_t start{};
+  float last_angle = 0, accum = 0;
+  uint32_t t0 = 0;
+} gesture;
 
 lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
 
@@ -166,9 +186,14 @@ lv_obj_t* reset_screen() {
   player_stop();
   lv_obj_clean(scr);
   ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
+  touch_layer = volume_arc = volume_label = nullptr;
   if (flash_timer) {
     lv_timer_delete(flash_timer);
     flash_timer = nullptr;
+  }
+  if (volume_timer) {
+    lv_timer_delete(volume_timer);
+    volume_timer = nullptr;
   }
   lv_obj_set_style_bg_color(scr, color(theme.background), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -193,7 +218,14 @@ lv_obj_t* label(lv_obj_t* parent, const char* text, const lv_font_t* f, uint32_t
   return l;
 }
 
+// What the character shows: muted replaces idle and sleeping; activity (listening, speaking, ...) shows as usual.
+String shown_state() {
+  if (muted && (current_state == "idle" || current_state == "sleeping")) return "muted";
+  return current_state;
+}
+
 uint32_t ring_color(const String& state) {
+  if (state == "muted") return 0xff9640;
   if (state == "listening") return theme.primary;
   if (state == "thinking") return theme.muted;
   if (state == "speaking") return theme.accent;
@@ -206,6 +238,7 @@ const char* default_status(const String& state) {
   if (state == "listening") return "Listening...";
   if (state == "thinking") return "Thinking...";
   if (state == "error") return "Something went wrong";
+  if (state == "muted") return "Mic off";
   return "";
 }
 
@@ -230,15 +263,102 @@ void update_clock(lv_timer_t* = nullptr) {
 }
 
 void apply_state() {
-  if (ring) lv_obj_set_style_border_color(ring, color(ring_color(current_state)), 0);
+  const String state = shown_state();
+  if (ring) lv_obj_set_style_border_color(ring, color(ring_color(state)), 0);
   if (status_label) {
-    lv_label_set_text(status_label, status_text.length() ? status_text.c_str() : default_status(current_state));
+    lv_label_set_text(status_label, status_text.length() ? status_text.c_str() : default_status(state));
   }
   if (anim_img) {
-    int i = stateIndex(current_state.c_str());
+    int i = stateIndex(state.c_str());
     if (i < 0 || !character[i]) i = 0;
     player_play(character[i]);
   }
+}
+
+// Volume arc
+
+void show_volume(int percent) {
+  if (!volume_arc) return;
+  lv_arc_set_value(volume_arc, percent);
+  lv_label_set_text_fmt(volume_label, percent ? "%d%%" : "Silent", percent);
+  lv_obj_remove_flag(volume_arc, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_remove_flag(volume_label, LV_OBJ_FLAG_HIDDEN);
+  lv_timer_reset(volume_timer);
+  lv_timer_resume(volume_timer);
+}
+
+void hide_volume(lv_timer_t* t) {
+  lv_obj_add_flag(volume_arc, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(volume_label, LV_OBJ_FLAG_HIDDEN);
+  lv_timer_pause(t);
+}
+
+void create_touch_layer(lv_obj_t* scr) {
+  volume_arc = lv_arc_create(scr);
+  lv_obj_set_size(volume_arc, board::SCREEN_SIZE - 8, board::SCREEN_SIZE - 8);
+  lv_obj_set_pos(volume_arc, 4, 4);
+  lv_arc_set_rotation(volume_arc, 135);  // gap at the bottom; 0% bottom-left, 100% bottom-right
+  lv_arc_set_bg_angles(volume_arc, 0, 270);
+  lv_arc_set_range(volume_arc, 0, 100);
+  lv_obj_remove_flag(volume_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(volume_arc, 10, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(volume_arc, 10, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(volume_arc, color(theme.surface), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(volume_arc, color(theme.primary), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(volume_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(volume_arc, 0, LV_PART_KNOB);
+  lv_obj_add_flag(volume_arc, LV_OBJ_FLAG_HIDDEN);
+
+  volume_label = label(scr, "", &lv_font_montserrat_24, theme.text, 60, 196, 120, 30);
+  lv_obj_add_flag(volume_label, LV_OBJ_FLAG_HIDDEN);
+  volume_timer = lv_timer_create(hide_volume, VOLUME_HIDE_MS, nullptr);
+  lv_timer_pause(volume_timer);
+
+  touch_layer = lv_obj_create(scr);
+  lv_obj_remove_style_all(touch_layer);
+  lv_obj_set_size(touch_layer, board::SCREEN_SIZE, board::SCREEN_SIZE);
+  lv_obj_set_pos(touch_layer, 0, 0);
+  lv_obj_remove_flag(touch_layer, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(
+      touch_layer,
+      [](lv_event_t* e) {
+        const lv_event_code_t code = lv_event_get_code(e);
+        lv_indev_t* indev = lv_indev_active();
+        if (!indev) return;
+        lv_point_t p;
+        lv_indev_get_point(indev, &p);
+        const float dx = p.x - board::SCREEN_SIZE / 2, dy = p.y - board::SCREEN_SIZE / 2;
+        const float r = sqrtf(dx * dx + dy * dy);
+        const float angle = atan2f(dy, dx) * 180.0f / PI;  // clockwise on screen
+        Gesture& g = gesture;
+        if (code == LV_EVENT_PRESSED) {
+          g = Gesture{};
+          g.edge = r >= EDGE_RADIUS;
+          g.start = p;
+          g.last_angle = angle;
+          g.t0 = millis();
+        } else if (code == LV_EVENT_PRESSING) {
+          if (g.edge) {
+            if (r < 40) return;  // the angle is meaningless near the centre
+            float d = angle - g.last_angle;
+            while (d > 180) d -= 360;
+            while (d < -180) d += 360;
+            g.last_angle = angle;
+            g.accum += d;
+            if (!g.dragging && fabsf(g.accum) > 8) g.dragging = true;
+            const int steps = static_cast<int>(g.accum / DEGREES_PER_PERCENT);
+            if (g.dragging && steps && volume_cb) {
+              g.accum -= steps * DEGREES_PER_PERCENT;
+              show_volume(volume_cb(steps));
+            }
+          } else if (abs(p.x - g.start.x) + abs(p.y - g.start.y) > 24) {
+            g.cancelled = true;  // a swipe, not a tap
+          }
+        } else if (code == LV_EVENT_RELEASED) {
+          if (!g.edge && !g.cancelled && millis() - g.t0 < 1000 && tap_cb) tap_cb();
+        }
+      },
+      LV_EVENT_ALL, nullptr);
 }
 
 }  // namespace
@@ -343,6 +463,7 @@ void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24
     lv_obj_set_style_border_width(ring, ring_widget->thickness, 0);
     lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
   }
+  create_touch_layer(scr);  // last, so it is on top
   update_clock();
   apply_state();
 }
@@ -361,6 +482,19 @@ void setState(const char* state) {
 }
 
 const char* state() { return current_state.c_str(); }
+
+void setMuted(bool m) {
+  Lock l;
+  if (muted == m) return;
+  muted = m;
+  apply_state();
+}
+
+void onTouch(void (*on_tap)(), int (*on_volume)(int delta)) {
+  Lock l;
+  tap_cb = on_tap;
+  volume_cb = on_volume;
+}
 
 void setStatusText(const char* text) {
   Lock l;
