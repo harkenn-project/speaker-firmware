@@ -21,12 +21,21 @@ void play(Sound sound);  // queued; volume ticks are dropped while something els
 void setMicMuted(bool muted);
 bool micMuted();
 
-// Records into PSRAM until stopRecording() or max_ms. Returns false if muted or out of memory.
-bool startRecording(uint32_t max_ms);
+// Records into PSRAM until stopRecording(), max_ms, or silence_ms without speech (counted from the start until
+// speech is first heard). Returns false if muted or out of memory.
+bool startRecording(uint32_t max_ms, uint32_t silence_ms);
 void stopRecording();
 bool recording();
+
+struct RecordingInfo {
+  size_t size = 0;
+  uint32_t duration_ms = 0;
+  int peak_percent = 0;
+  bool speech = false;  // any speech heard at all
+  int noise_floor = 0;  // background level, mean absolute amplitude
+};
 // The last finished recording as a complete WAV file (header included), or nullptr. Owned by the caller,
 // free with heap_caps_free().
-uint8_t* takeRecordingWav(size_t* size, uint32_t* duration_ms, int* peak_percent);
+uint8_t* takeRecordingWav(RecordingInfo* info);
 
 }  // namespace audio

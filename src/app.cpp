@@ -29,7 +29,7 @@ constexpr uint32_t STATUS_INTERVAL_MS = 30000;
 constexpr uint32_t LOG_FLUSH_MS = 2000;
 constexpr uint32_t WS_GIVE_UP_MS = 30000;  // then re-check the token over HTTP
 constexpr size_t MAX_ASSET_BYTES = 3 * 1024 * 1024;
-constexpr uint32_t MAX_RECORD_MS = 8000;
+constexpr uint32_t MAX_RECORD_MS = 30000;
 constexpr uint32_t CHIME_MS = 350;          // start recording after the activation chime, so it isn't recorded
 constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
 
@@ -72,6 +72,7 @@ int config_version = 0;
 int brightness = 75;
 volatile int volume = 70;
 uint32_t sleep_after_ms = 300000;
+uint32_t silence_ms = 5000;  // stop listening after this long without speech
 bool dimmed = false;
 std::map<String, std::shared_ptr<ui::Blob>> blobs;  // animations by URL, so unchanged ones aren't downloaded again
 
@@ -355,6 +356,7 @@ void apply_config(JsonDocument& doc) {
 
   brightness = display["brightness"] | 75;
   sleep_after_ms = static_cast<uint32_t>(display["sleep_after_s"] | 300) * 1000;
+  silence_ms = constrain(cfg["audio"]["silence_s"] | 5, 1, 30) * 1000;
   // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
   const int config_volume = constrain(cfg["audio"]["volume"] | 70, 0, 100);
   if (config_volume != store::configVolume()) {
@@ -452,20 +454,24 @@ void show_status_text(const char* text, uint32_t ms) {
 
 void finish_voice() {
   voice = Voice::Off;
-  size_t size = 0;
-  uint32_t ms = 0;
-  int peak = 0;
-  uint8_t* wav = audio::takeRecordingWav(&size, &ms, &peak);
-  if (!wav || audio::micMuted()) {  // muted mid-recording: throw it away
+  audio::RecordingInfo info;
+  uint8_t* wav = audio::takeRecordingWav(&info);
+  if (!wav || audio::micMuted() || !info.speech) {  // muted mid-recording, or nothing said: throw it away
     if (wav) heap_caps_free(wav);
+    if (wav && !info.speech && !audio::micMuted()) {
+      LOGI(TAG, "heard nothing in %u ms (noise floor %d, peak %d%%)", info.duration_ms, info.noise_floor,
+           info.peak_percent);
+      audio::play(audio::Sound::Cancel);
+    }
     ui::setState("idle");
     return;
   }
   audio::play(audio::Sound::Done);
   ui::setState("thinking");
-  const int code = upload_recording(wav, size, "utterance");
+  const int code = upload_recording(wav, info.size, "utterance");
   heap_caps_free(wav);
-  LOGI(TAG, "recorded %u ms, peak %d%%, upload HTTP %d", ms, peak, code);
+  LOGI(TAG, "recorded %u ms, peak %d%%, noise floor %d, upload HTTP %d", info.duration_ms, info.peak_percent,
+       info.noise_floor, code);
   if (code == 201) {
     ui::setState("idle");
   } else {
@@ -501,7 +507,7 @@ void update_voice() {
     voice = Voice::Off;
     ui::setState("idle");
   } else if (voice == Voice::Starting && static_cast<int32_t>(millis() - voice_at) >= 0) {
-    if (audio::startRecording(MAX_RECORD_MS)) {
+    if (audio::startRecording(MAX_RECORD_MS, silence_ms)) {
       voice = Voice::Recording;
     } else {
       voice = Voice::Off;

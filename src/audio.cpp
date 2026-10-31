@@ -97,7 +97,10 @@ bool i2s_init() {
           },
   };
   std.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-  return i2s_channel_init_std_mode(tx, &std) == ESP_OK && i2s_channel_init_std_mode(rx, &std) == ESP_OK &&
+  // Mono with both slots enabled reads left and right interleaved (twice the samples): capture the left slot only.
+  i2s_std_config_t in = std;
+  in.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+  return i2s_channel_init_std_mode(tx, &std) == ESP_OK && i2s_channel_init_std_mode(rx, &in) == ESP_OK &&
          i2s_channel_enable(tx) == ESP_OK && i2s_channel_enable(rx) == ESP_OK;
 }
 
@@ -188,10 +191,30 @@ struct Recording {
   uint8_t* wav = nullptr;  // 44-byte header, then samples
   size_t capacity = 0;     // sample capacity
   size_t samples = 0;
+  size_t silence_limit = 0;  // stop after this many samples without speech
+  size_t quiet = 0;          // samples since speech was last heard (or since the start)
+  bool speech = false;
   int16_t peak = 0;
 };
 Recording active, finished;
 bool active_on = false;
+
+// Voice activity: a chunk is speech when its level is well above the background noise, which is tracked all the
+// time (also between recordings) as a slowly rising, quickly falling floor.
+constexpr float SPEECH_RATIO = 3.0f;
+constexpr float MIN_SPEECH_LEVEL = 250.0f;  // mean absolute amplitude, out of 32767
+float noise_floor = 200.0f;
+
+bool is_speech(const int16_t* s, size_t n) {
+  float sum = 0;
+  for (size_t i = 0; i < n; i++) sum += abs(s[i]);
+  const float level = sum / n;
+  const bool speech = level > noise_floor * SPEECH_RATIO && level > MIN_SPEECH_LEVEL;
+  if (level < noise_floor) noise_floor += (level - noise_floor) * 0.1f;
+  else if (!speech) noise_floor += (level - noise_floor) * 0.01f;
+  noise_floor = max(noise_floor, 20.0f);
+  return speech;
+}
 
 void put_le(uint8_t* p, uint32_t v, int bytes) {
   for (int i = 0; i < bytes; i++) p[i] = v >> (8 * i);
@@ -225,11 +248,18 @@ void capture_task(void*) {
     size_t got = 0;
     if (i2s_channel_read(rx, buf, sizeof(buf), &got, pdMS_TO_TICKS(200)) != ESP_OK || !got) continue;
     const size_t n = got / sizeof(int16_t);
+    const bool speech = !mic_muted && is_speech(buf, n);
     xSemaphoreTake(rec_mutex, portMAX_DELAY);
     if (active_on) {
       if (mic_muted) {
         finish_locked();
       } else {
+        if (speech) {
+          active.speech = true;
+          active.quiet = 0;
+        } else {
+          active.quiet += n;
+        }
         const size_t take = min(n, active.capacity - active.samples);
         int16_t* dst = reinterpret_cast<int16_t*>(active.wav + 44) + active.samples;
         for (size_t i = 0; i < take; i++) {
@@ -238,7 +268,7 @@ void capture_task(void*) {
           if (a > active.peak) active.peak = a;
         }
         active.samples += take;
-        if (active.samples >= active.capacity) finish_locked();
+        if (active.samples >= active.capacity || active.quiet >= active.silence_limit) finish_locked();
       }
     }
     xSemaphoreGive(rec_mutex);
@@ -291,14 +321,17 @@ void setMicMuted(bool muted) {
 
 bool micMuted() { return mic_muted; }
 
-bool startRecording(uint32_t max_ms) {
+bool startRecording(uint32_t max_ms, uint32_t silence_ms) {
   if (!ok || mic_muted) return false;
   const size_t samples = SAMPLE_RATE / 1000 * max_ms;
   uint8_t* wav = static_cast<uint8_t*>(heap_caps_malloc(44 + samples * 2, MALLOC_CAP_SPIRAM));
   if (!wav) return false;
   xSemaphoreTake(rec_mutex, portMAX_DELAY);
   if (active_on) heap_caps_free(active.wav);
-  active = {wav, samples, 0, 0};
+  active = {};
+  active.wav = wav;
+  active.capacity = samples;
+  active.silence_limit = SAMPLE_RATE / 1000 * silence_ms;
   active_on = true;
   xSemaphoreGive(rec_mutex);
   return true;
@@ -312,13 +345,15 @@ void stopRecording() {
 
 bool recording() { return active_on; }
 
-uint8_t* takeRecordingWav(size_t* size, uint32_t* duration_ms, int* peak_percent) {
+uint8_t* takeRecordingWav(RecordingInfo* info) {
   xSemaphoreTake(rec_mutex, portMAX_DELAY);
   uint8_t* wav = finished.wav;
   if (wav) {
-    *size = 44 + finished.samples * 2;
-    *duration_ms = finished.samples * 1000 / SAMPLE_RATE;
-    *peak_percent = finished.peak * 100 / 32767;
+    info->size = 44 + finished.samples * 2;
+    info->duration_ms = finished.samples * 1000 / SAMPLE_RATE;
+    info->peak_percent = finished.peak * 100 / 32767;
+    info->speech = finished.speech;
+    info->noise_floor = static_cast<int>(noise_floor);
     finished = {};
   }
   xSemaphoreGive(rec_mutex);
