@@ -17,25 +17,32 @@ int volume();
 
 void play(Sound sound);  // queued; volume ticks are dropped while something else is waiting
 
-// Microphone. While muted, nothing is captured and recordings stop.
+// Microphone. While muted, nothing is captured and listening stops.
 void setMicMuted(bool muted);
 bool micMuted();
 
-// Records into PSRAM until stopRecording(), max_ms, or silence_ms without speech (counted from the start until
-// speech is first heard). Returns false if muted or out of memory.
-bool startRecording(uint32_t max_ms, uint32_t silence_ms);
-void stopRecording();
-bool recording();
+// Listening: while on, microphone audio is queued for readMic(). Stops on stopListening(), after max_ms, or after
+// silence_ms without speech (counted from the start until speech is first heard). False if muted.
+bool startListening(uint32_t max_ms, uint32_t silence_ms);
+void stopListening();
+bool listening();
+size_t readMic(uint8_t* dst, size_t max_bytes);  // 16-bit PCM queued since the last call; never blocks
 
-struct RecordingInfo {
-  size_t size = 0;
+struct ListenInfo {
   uint32_t duration_ms = 0;
   int peak_percent = 0;
   bool speech = false;  // any speech heard at all
   int noise_floor = 0;  // background level, mean absolute amplitude
+  uint32_t dropped_ms = 0;  // audio lost because it wasn't read fast enough
 };
-// The last finished recording as a complete WAV file (header included), or nullptr. Owned by the caller,
-// free with heap_caps_free().
-uint8_t* takeRecordingWav(RecordingInfo* info);
+ListenInfo listenInfo();  // about the current or last listening session
+
+// Speech from Kotodama (16 kHz, 16-bit mono): startSpeech(), writeSpeech() as it arrives, endSpeech() when all is
+// sent. speaking() stays true until it has been played. stopSpeech() cuts it off.
+void startSpeech();
+size_t writeSpeech(const uint8_t* pcm, size_t bytes);  // returns bytes accepted (the rest didn't fit)
+void endSpeech();
+void stopSpeech();
+bool speaking();
 
 }  // namespace audio

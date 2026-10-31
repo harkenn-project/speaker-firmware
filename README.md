@@ -4,7 +4,7 @@ Firmware for the Spotpear ESP32-S3 1.28" BOX: ESP32-S3 N16R8, a GC9A01 240×240 
 ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9 and LovyanGFX. It speaks the
 protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
-## What it does (v0.4)
+## What it does (v0.6)
 
 1. **Wi-Fi.** With no saved network, it opens the access point `Kotodama-XXXX`. Join it, and a page at
    `http://192.168.4.1` lets you pick a network. The page has an *Advanced* field for the server URL, which defaults
@@ -18,15 +18,16 @@ protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
    - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and
      `update_firmware` (see *Updates* below).
    - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
-5. **Touch and sound.** Tap the middle to talk: a chime, then it records until you tap again or stop speaking for
-   `audio.silence_s` (default 5 s, at most 30 s), and uploads the clip to Kotodama's Recordings. Drag around the edge
+5. **Talking.** Tap the middle to talk: a chime, then it streams what it hears to Kotodama until you tap again or stop speaking for
+   `audio.silence_s` (default 5 s, at most 30 s). Kotodama answers with speech, which the speaker plays while the character
+   talks; a tap stops it. Drag around the edge
    to change the volume; the speaker's own volume wins over the config unless the volume in the config changes.
 6. **BOOT button.**
    - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
    - Hold 5 s: opens Wi-Fi setup on the next boot, keeping saved networks.
    - Hold 10 s: factory reset, forgetting Wi-Fi, the token and the server URL.
 
-Not yet implemented: wake word, streaming to the voice pipeline, spoken replies.
+Not yet implemented: wake word, configurable sounds.
 
 ## Build and flash
 

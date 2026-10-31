@@ -32,8 +32,9 @@ constexpr uint32_t STATUS_INTERVAL_MS = 30000;
 constexpr uint32_t LOG_FLUSH_MS = 2000;
 constexpr uint32_t WS_GIVE_UP_MS = 30000;  // then re-check the token over HTTP
 constexpr size_t MAX_ASSET_BYTES = 3 * 1024 * 1024;
-constexpr uint32_t MAX_RECORD_MS = 30000;
-constexpr uint32_t CHIME_MS = 350;          // start recording after the activation chime, so it isn't recorded
+constexpr uint32_t MAX_LISTEN_MS = 30000;
+constexpr uint32_t REPLY_TIMEOUT_MS = 60000;  // the first answer can be slow while Kotodama loads its models
+constexpr uint32_t CHIME_MS = 350;          // start listening after the activation chime, so it isn't sent
 constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
 
 struct ServerUrl {
@@ -106,9 +107,11 @@ std::unique_ptr<FirmwareUpdate> offered_update;  // shown on screen as "Update a
 volatile bool offer_install = false, offer_dismiss = false;
 bool update_checked = false;  // asked Kotodama for updates since boot
 
-enum class Voice { Off, Starting, Recording };
+enum class Voice { Off, Starting, Listening, Waiting, Speaking };
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
+uint32_t voice_session = 0;
+size_t speech_dropped = 0;
 
 String ap_name() {
   String suffix = device_id.substring(8);
@@ -142,20 +145,6 @@ int request(const char* method, const String& path, const String& body, String* 
     code = http.GET();
   }
   if (code > 0 && response) *response = http.getString();
-  http.end();
-  return code;
-}
-
-int upload_recording(uint8_t* wav, size_t size, const char* kind) {
-  const String url = server_url + "/api/v1/device/recordings?kind=" + kind;
-  auto client = make_client(url);
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  http.setTimeout(20000);
-  if (!http.begin(*client, url)) return -1;
-  http.addHeader("Authorization", "Bearer " + token);
-  http.addHeader("Content-Type", "audio/wav");
-  const int code = http.POST(wav, size);
   http.end();
   return code;
 }
@@ -528,7 +517,7 @@ void set_volume_local(int v) {
   volume_changed_at = millis();
 }
 
-// Voice: a tap starts listening; for now the recording is uploaded to Kotodama (Recordings in the admin UI).
+// Voice: a tap starts listening. What the mic hears streams to Kotodama, which answers with speech (docs/PROTOCOL.md).
 
 void flash_state(const char* state, uint32_t ms) {
   if (!play_state_until) play_state_restore = "idle";
@@ -541,44 +530,85 @@ void show_status_text(const char* text, uint32_t ms) {
   status_text_until = millis() + ms;
 }
 
-void finish_voice() {
+void send_voice(const char* type) {
+  JsonDocument doc;
+  doc["type"] = type;
+  doc["session"] = String(voice_session);
+  send_json(doc);
+}
+
+void voice_done(const char* state = "idle") {
   voice = Voice::Off;
-  audio::RecordingInfo info;
-  uint8_t* wav = audio::takeRecordingWav(&info);
-  if (!wav || audio::micMuted() || !info.speech) {  // muted mid-recording, or nothing said: throw it away
-    if (wav) heap_caps_free(wav);
-    if (wav && !info.speech && !audio::micMuted()) {
-      LOGI(TAG, "heard nothing in %u ms (noise floor %d, peak %d%%)", info.duration_ms, info.noise_floor,
-           info.peak_percent);
-      audio::play(audio::Sound::Cancel);
-    }
-    ui::setState("idle");
-    return;
-  }
-  audio::play(audio::Sound::Done);
-  ui::setState("thinking");
-  const int code = upload_recording(wav, info.size, "utterance");
-  heap_caps_free(wav);
-  LOGI(TAG, "recorded %u ms, peak %d%%, noise floor %d, upload HTTP %d", info.duration_ms, info.peak_percent,
-       info.noise_floor, code);
-  if (code == 201) {
-    ui::setState("idle");
+  ui::setState(state);
+}
+
+void voice_failed(const char* why) {
+  LOGW(TAG, "voice: %s", why);
+  voice = Voice::Off;
+  audio::play(audio::Sound::Error);
+  flash_state("error", 3000);
+}
+
+void start_voice() {
+  char now[24];
+  const time_t t = time(nullptr);
+  struct tm local;
+  localtime_r(&t, &local);
+  strftime(now, sizeof(now), "%Y-%m-%dT%H:%M:%S", &local);
+  voice_session++;
+  JsonDocument doc;
+  doc["type"] = "voice_start";
+  doc["session"] = String(voice_session);
+  doc["rate"] = audio::SAMPLE_RATE;
+  if (t > 1700000000) doc["local_time"] = now;
+  send_json(doc);
+  voice = Voice::Listening;
+}
+
+// Sends what the mic has queued; when listening has stopped, ends the utterance.
+void pump_mic() {
+  static uint8_t buf[3200];  // 100 ms
+  size_t n;
+  while ((n = audio::readMic(buf, sizeof(buf))) > 0) ws.sendBIN(buf, n);
+  if (audio::listening()) return;
+  const audio::ListenInfo info = audio::listenInfo();
+  if (audio::micMuted()) {  // muted mid-sentence: drop it
+    send_voice("voice_cancel");
+    voice_done();
+  } else if (!info.speech) {
+    LOGI(TAG, "heard nothing in %u ms (noise floor %d, peak %d%%)", info.duration_ms, info.noise_floor,
+         info.peak_percent);
+    send_voice("voice_cancel");
+    audio::play(audio::Sound::Cancel);
+    voice_done();
   } else {
-    audio::play(audio::Sound::Error);
-    flash_state("error", 3000);
+    LOGI(TAG, "sent %u ms of speech (peak %d%%, noise floor %d, %u ms dropped)", info.duration_ms, info.peak_percent,
+         info.noise_floor, info.dropped_ms);
+    send_voice("voice_end");
+    audio::play(audio::Sound::Done);
+    ui::setState("thinking");
+    voice = Voice::Waiting;
+    voice_at = millis() + REPLY_TIMEOUT_MS;
   }
 }
 
 void handle_tap() {
-  if (voice == Voice::Recording) {
-    audio::stopRecording();  // finish_voice() picks it up
-  } else if (voice == Voice::Starting) {
-    voice = Voice::Off;
+  if (voice == Voice::Listening) {
+    audio::stopListening();  // pump_mic() ends the utterance
+  } else if (voice == Voice::Starting || voice == Voice::Waiting) {
+    if (voice == Voice::Waiting) send_voice("voice_cancel");
     audio::play(audio::Sound::Cancel);
-    ui::setState("idle");
+    voice_done();
+  } else if (voice == Voice::Speaking) {
+    audio::stopSpeech();
+    send_voice("speak_stop");
+    voice_done();
   } else if (audio::micMuted()) {
     audio::play(audio::Sound::Cancel);
     show_status_text("Mic is off", 2500);
+  } else if (!ws_connected) {
+    audio::play(audio::Sound::Error);
+    show_status_text("Not connected", 2500);
   } else if (strcmp(ui::state(), "idle") == 0 || strcmp(ui::state(), "sleeping") == 0) {
     audio::play(audio::Sound::Activate);
     ui::setState("listening");
@@ -587,26 +617,53 @@ void handle_tap() {
   }
 }
 
+// Messages from Kotodama about the current utterance.
+void handle_voice_message(const String& type, JsonDocument& doc) {
+  if (type == "speak_start") {  // a reply, or something Kotodama wants said (admin "Say it")
+    audio::startSpeech();
+    speech_dropped = 0;
+    voice = Voice::Speaking;
+    ui::setState("speaking");
+    return;
+  }
+  if (type == "speak_end") {
+    audio::endSpeech();
+    if (speech_dropped) LOGW(TAG, "speech: %u bytes didn't fit the buffer", speech_dropped);
+    return;
+  }
+  if (String(doc["session"] | "") != String(voice_session)) return;  // about an utterance we've given up on
+  if (type == "voice_result") {
+    const String heard = doc["heard"] | "";
+    if (!heard.length() && voice == Voice::Waiting) {
+      audio::play(audio::Sound::Cancel);
+      voice_done();
+    } else {
+      LOGI(TAG, "heard \"%s\"", heard.c_str());
+    }
+  } else if (type == "voice_error" && (voice == Voice::Waiting || voice == Voice::Listening)) {
+    voice_failed((doc["message"] | "Kotodama couldn't answer"));
+  }
+}
 void update_voice() {
   if (tap_requested) {
     tap_requested = false;
     handle_tap();
   }
-  if (voice == Voice::Starting && audio::micMuted()) {  // muted before recording began
-    voice = Voice::Off;
-    ui::setState("idle");
+  if (voice == Voice::Starting && audio::micMuted()) {  // muted before listening began
+    voice_done();
   } else if (voice == Voice::Starting && static_cast<int32_t>(millis() - voice_at) >= 0) {
-    if (audio::startRecording(MAX_RECORD_MS, silence_ms)) {
-      voice = Voice::Recording;
-    } else {
-      voice = Voice::Off;
-      audio::play(audio::Sound::Error);
-      flash_state("error", 3000);
-    }
-  } else if (voice == Voice::Recording && !audio::recording()) {
-    finish_voice();
-  }
-  if (status_text_until && static_cast<int32_t>(millis() - status_text_until) >= 0) {
+    if (!ws_connected) voice_failed("not connected");
+    else if (audio::startListening(MAX_LISTEN_MS, silence_ms)) start_voice();
+    else voice_failed("couldn't start listening");
+  } else if (voice == Voice::Listening) {
+    if (ws_connected) pump_mic();
+    else voice_failed("connection lost while listening");
+  } else if (voice == Voice::Waiting && static_cast<int32_t>(millis() - voice_at) >= 0) {
+    send_voice("voice_cancel");
+    voice_failed("no answer from Kotodama");
+  } else if (voice == Voice::Speaking && !audio::speaking()) {
+    voice_done();
+  }  if (status_text_until && static_cast<int32_t>(millis() - status_text_until) >= 0) {
     status_text_until = 0;
     ui::setStatusText("");
   }
@@ -639,6 +696,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     ws.sendTXT("{\"type\":\"pong\"}");
+  } else if (type.startsWith("speak_") || type.startsWith("voice_")) {
+    handle_voice_message(type, doc);
   } else if (type == "update_available") {
     JsonObject f = doc["firmware"];
     auto fw = std::unique_ptr<FirmwareUpdate>(new FirmwareUpdate());
@@ -707,10 +766,14 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
     case WStype_DISCONNECTED:
       if (ws_connected) LOGW(TAG, "connection to Kotodama lost");
       ws_connected = false;
+      if (voice == Voice::Speaking) audio::endSpeech();  // play what arrived
       if (!ws_down_since) ws_down_since = millis();
       break;
     case WStype_TEXT:
       handle_text(payload, len);
+      break;
+    case WStype_BIN:  // speech for the current reply
+      if (voice == Voice::Speaking) speech_dropped += len - audio::writeSpeech(payload, len);
       break;
     default:
       break;
@@ -722,7 +785,8 @@ void run_firmware_update() {
   LOGI(TAG, "updating firmware %s -> %s (%u bytes)", FW_VERSION, fw->version.c_str(), fw->size);
   flush_logs();
   voice = Voice::Off;
-  audio::stopRecording();
+  audio::stopListening();
+  audio::stopSpeech();
   ws.disconnect();
   ws_connected = false;
   ui::showProgress("Updating firmware", fw->version.c_str(), 0);

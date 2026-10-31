@@ -2,6 +2,7 @@
 
 #include <Wire.h>
 #include <driver/i2s_std.h>
+#include <freertos/stream_buffer.h>
 #include <math.h>
 
 #include "board.h"
@@ -164,43 +165,61 @@ void render(const Note* notes) {
   }
 }
 
+// Speech from Kotodama: PCM written by the main task into a PSRAM stream buffer, played by the play task.
+constexpr size_t SPEECH_BUFFER_BYTES = 512 * 1024;  // 16 s; Kotodama stays at most 3 s ahead
+StreamBufferHandle_t speech = nullptr;
+volatile bool speech_on = false, speech_ending = false;
+
+void amp(bool on) {
+  static bool is_on = false;
+  if (on == is_on) return;
+  digitalWrite(pins::AMP_EN, on ? HIGH : LOW);
+  is_on = on;
+  if (on) delay(5);
+}
+
 void play_task(void*) {
-  bool amp = false;
+  static int16_t buf[CHUNK];
   for (;;) {
     Sound s;
-    if (xQueueReceive(queue, &s, pdMS_TO_TICKS(AMP_OFF_AFTER_MS)) != pdTRUE) {
-      if (amp) {
-        digitalWrite(pins::AMP_EN, LOW);
-        amp = false;
+    if (xQueueReceive(queue, &s, speech_on ? 0 : pdMS_TO_TICKS(AMP_OFF_AFTER_MS)) == pdTRUE) {
+      if (current_volume <= 0) continue;
+      amp(true);
+      render(notes_for(s));
+      continue;
+    }
+    if (speech_on) {
+      const size_t n = xStreamBufferReceive(speech, buf, sizeof(buf), pdMS_TO_TICKS(20));
+      if (n) {
+        amp(true);
+        write_samples(buf, n / sizeof(int16_t));
+      } else if (speech_ending) {
+        speech_on = false;  // everything sent has been played
       }
       continue;
     }
-    if (current_volume <= 0) continue;
-    if (!amp) {
-      digitalWrite(pins::AMP_EN, HIGH);
-      amp = true;
-      delay(5);
-    }
-    render(notes_for(s));
+    amp(false);
   }
 }
 
-// Capture
+// Microphone: while listening, captured audio goes into a stream buffer that the main task drains and sends.
 
-struct Recording {
-  uint8_t* wav = nullptr;  // 44-byte header, then samples
-  size_t capacity = 0;     // sample capacity
-  size_t samples = 0;
+constexpr size_t MIC_BUFFER_BYTES = 64 * 1024;  // 2 s of slack if Wi-Fi stalls
+StreamBufferHandle_t mic = nullptr;
+
+struct Listen {
+  size_t samples = 0, max_samples = 0;
   size_t silence_limit = 0;  // stop after this many samples without speech
   size_t quiet = 0;          // samples since speech was last heard (or since the start)
   bool speech = false;
   int16_t peak = 0;
+  size_t dropped = 0;  // samples lost because the buffer was full
 };
-Recording active, finished;
-bool active_on = false;
+Listen listen_state;
+volatile bool listen_on = false;
 
 // Voice activity: a chunk is speech when its level is well above the background noise, which is tracked all the
-// time (also between recordings) as a slowly rising, quickly falling floor.
+// time (also between sessions) as a slowly rising, quickly falling floor.
 constexpr float SPEECH_RATIO = 3.0f;
 constexpr float MIN_SPEECH_LEVEL = 250.0f;  // mean absolute amplitude, out of 32767
 float noise_floor = 200.0f;
@@ -216,32 +235,6 @@ bool is_speech(const int16_t* s, size_t n) {
   return speech;
 }
 
-void put_le(uint8_t* p, uint32_t v, int bytes) {
-  for (int i = 0; i < bytes; i++) p[i] = v >> (8 * i);
-}
-
-void finish_locked() {
-  if (!active_on) return;
-  active_on = false;
-  uint8_t* h = active.wav;
-  const uint32_t data = active.samples * 2;
-  memcpy(h, "RIFF", 4);
-  put_le(h + 4, 36 + data, 4);
-  memcpy(h + 8, "WAVEfmt ", 8);
-  put_le(h + 16, 16, 4);
-  put_le(h + 20, 1, 2);  // PCM
-  put_le(h + 22, 1, 2);  // mono
-  put_le(h + 24, SAMPLE_RATE, 4);
-  put_le(h + 28, SAMPLE_RATE * 2, 4);
-  put_le(h + 32, 2, 2);
-  put_le(h + 34, 16, 2);
-  memcpy(h + 36, "data", 4);
-  put_le(h + 40, data, 4);
-  if (finished.wav) heap_caps_free(finished.wav);
-  finished = active;
-  active = {};
-}
-
 void capture_task(void*) {
   static int16_t buf[CHUNK];
   for (;;) {
@@ -250,29 +243,35 @@ void capture_task(void*) {
     const size_t n = got / sizeof(int16_t);
     const bool speech = !mic_muted && is_speech(buf, n);
     xSemaphoreTake(rec_mutex, portMAX_DELAY);
-    if (active_on) {
+    if (listen_on) {
+      Listen& l = listen_state;
       if (mic_muted) {
-        finish_locked();
+        listen_on = false;
       } else {
         if (speech) {
-          active.speech = true;
-          active.quiet = 0;
+          l.speech = true;
+          l.quiet = 0;
         } else {
-          active.quiet += n;
+          l.quiet += n;
         }
-        const size_t take = min(n, active.capacity - active.samples);
-        int16_t* dst = reinterpret_cast<int16_t*>(active.wav + 44) + active.samples;
-        for (size_t i = 0; i < take; i++) {
-          dst[i] = buf[i];
+        for (size_t i = 0; i < n; i++) {
           const int16_t a = buf[i] == INT16_MIN ? INT16_MAX : abs(buf[i]);
-          if (a > active.peak) active.peak = a;
+          if (a > l.peak) l.peak = a;
         }
-        active.samples += take;
-        if (active.samples >= active.capacity || active.quiet >= active.silence_limit) finish_locked();
+        const size_t sent = xStreamBufferSend(mic, buf, got, 0);
+        l.dropped += (got - sent) / sizeof(int16_t);
+        l.samples += n;
+        if (l.samples >= l.max_samples || l.quiet >= l.silence_limit) listen_on = false;
       }
     }
     xSemaphoreGive(rec_mutex);
   }
+}
+
+StreamBufferHandle_t psram_stream(size_t bytes) {
+  auto* storage = static_cast<uint8_t*>(heap_caps_malloc(bytes + 1, MALLOC_CAP_SPIRAM));
+  auto* control = static_cast<StaticStreamBuffer_t*>(heap_caps_malloc(sizeof(StaticStreamBuffer_t), MALLOC_CAP_INTERNAL));
+  return storage && control ? xStreamBufferCreateStatic(bytes, 1, storage, control) : nullptr;
 }
 
 }  // namespace
@@ -283,6 +282,12 @@ bool begin() {
   Wire.begin(pins::CODEC_SDA, pins::CODEC_SCL, 100000);
   rec_mutex = xSemaphoreCreateMutex();
   queue = xQueueCreate(8, sizeof(Sound));
+  speech = psram_stream(SPEECH_BUFFER_BYTES);
+  mic = psram_stream(MIC_BUFFER_BYTES);
+  if (!speech || !mic) {
+    LOGE(TAG, "out of memory for audio buffers");
+    return false;
+  }
   // I2S first: the codec needs MCLK running to accept its configuration.
   if (!i2s_init()) {
     LOGE(TAG, "I2S init failed");
@@ -321,43 +326,55 @@ void setMicMuted(bool muted) {
 
 bool micMuted() { return mic_muted; }
 
-bool startRecording(uint32_t max_ms, uint32_t silence_ms) {
+bool startListening(uint32_t max_ms, uint32_t silence_ms) {
   if (!ok || mic_muted) return false;
-  const size_t samples = SAMPLE_RATE / 1000 * max_ms;
-  uint8_t* wav = static_cast<uint8_t*>(heap_caps_malloc(44 + samples * 2, MALLOC_CAP_SPIRAM));
-  if (!wav) return false;
   xSemaphoreTake(rec_mutex, portMAX_DELAY);
-  if (active_on) heap_caps_free(active.wav);
-  active = {};
-  active.wav = wav;
-  active.capacity = samples;
-  active.silence_limit = SAMPLE_RATE / 1000 * silence_ms;
-  active_on = true;
+  xStreamBufferReset(mic);
+  listen_state = {};
+  listen_state.max_samples = SAMPLE_RATE / 1000 * max_ms;
+  listen_state.silence_limit = SAMPLE_RATE / 1000 * silence_ms;
+  listen_on = true;
   xSemaphoreGive(rec_mutex);
   return true;
 }
 
-void stopRecording() {
+void stopListening() { listen_on = false; }
+
+bool listening() { return listen_on; }
+
+size_t readMic(uint8_t* dst, size_t max_bytes) { return mic ? xStreamBufferReceive(mic, dst, max_bytes & ~1u, 0) : 0; }
+
+ListenInfo listenInfo() {
   xSemaphoreTake(rec_mutex, portMAX_DELAY);
-  finish_locked();
+  ListenInfo info;
+  info.duration_ms = listen_state.samples * 1000 / SAMPLE_RATE;
+  info.peak_percent = listen_state.peak * 100 / 32767;
+  info.speech = listen_state.speech;
+  info.noise_floor = static_cast<int>(noise_floor);
+  info.dropped_ms = listen_state.dropped * 1000 / SAMPLE_RATE;
   xSemaphoreGive(rec_mutex);
+  return info;
 }
 
-bool recording() { return active_on; }
-
-uint8_t* takeRecordingWav(RecordingInfo* info) {
-  xSemaphoreTake(rec_mutex, portMAX_DELAY);
-  uint8_t* wav = finished.wav;
-  if (wav) {
-    info->size = 44 + finished.samples * 2;
-    info->duration_ms = finished.samples * 1000 / SAMPLE_RATE;
-    info->peak_percent = finished.peak * 100 / 32767;
-    info->speech = finished.speech;
-    info->noise_floor = static_cast<int>(noise_floor);
-    finished = {};
-  }
-  xSemaphoreGive(rec_mutex);
-  return wav;
+void startSpeech() {
+  if (!ok) return;
+  speech_on = false;
+  for (int i = 0; i < 10 && xStreamBufferReset(speech) != pdPASS; i++) delay(10);  // the play task may still be waiting on it
+  speech_ending = false;
+  speech_on = true;
 }
+
+size_t writeSpeech(const uint8_t* pcm, size_t bytes) {
+  return ok && speech_on ? xStreamBufferSend(speech, pcm, bytes & ~1u, 0) : 0;
+}
+
+void endSpeech() { speech_ending = true; }
+
+void stopSpeech() {
+  speech_on = false;
+  speech_ending = false;
+}
+
+bool speaking() { return speech_on; }
 
 }  // namespace audio
