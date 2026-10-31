@@ -35,7 +35,7 @@ python -m venv .venv
 .venv\Scripts\pio device monitor      # serial log
 ```
 
-## Updates`n`nAfter the first USB flash, update over Wi-Fi: upload `.pio/build/kotodama-speaker/firmware.bin` on Kotodama's`n*Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and`nrestarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build`nyou upload (Kotodama reads it from the image).`n`nTo restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
+## Updates`n`nAfter the first USB flash, update over Wi-Fi: upload `.pio/build/kotodama-speaker/firmware.bin` on Kotodama's`n*Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and`nrestarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build`nyou upload (Kotodama reads it from the image).`n`n**Releases.** Pushing a new `FW_VERSION` to main makes the Jenkins job *Release kotodama firmware*`n(`../jenkins/release-firmware.xml`) build it and publish GitLab release `v<version>` with `firmware.bin`. Each speaker`nasks Kotodama for updates once when it starts; if the latest release is newer it shows *Update available* with`n*Install* and *Dismiss* (a dismissed version isn't offered again; a newer one is).`n`nTo restore the stock XiaoZhi firmware, write the full backup back to address 0 with esptool.
 
 ## Notes
 

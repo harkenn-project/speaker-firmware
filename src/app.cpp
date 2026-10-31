@@ -102,6 +102,9 @@ struct FirmwareUpdate {
   size_t size = 0;
 };
 std::unique_ptr<FirmwareUpdate> pending_update;
+std::unique_ptr<FirmwareUpdate> offered_update;  // shown on screen as "Update available"
+volatile bool offer_install = false, offer_dismiss = false;
+bool update_checked = false;  // asked Kotodama for updates since boot
 
 enum class Voice { Off, Starting, Recording };
 Voice voice = Voice::Off;
@@ -636,6 +639,22 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     ws.sendTXT("{\"type\":\"pong\"}");
+  } else if (type == "update_available") {
+    JsonObject f = doc["firmware"];
+    auto fw = std::unique_ptr<FirmwareUpdate>(new FirmwareUpdate());
+    fw->url = f["url"] | "";
+    fw->version = f["version"] | "";
+    fw->sha256 = f["sha256"] | "";
+    fw->size = f["size"] | 0;
+    if (!fw->version.length() || fw->version == FW_VERSION) return;
+    if (fw->version == store::dismissedUpdate()) {
+      LOGI(TAG, "firmware %s available (dismissed earlier)", fw->version.c_str());
+      return;
+    }
+    LOGI(TAG, "firmware %s available", fw->version.c_str());
+    ui::showUpdateOffer(fw->version.c_str(), [] { offer_install = true; }, [] { offer_dismiss = true; });
+    board::markActivity();
+    offered_update = std::move(fw);
   } else if (type == "command") {
     const String command = doc["command"] | "";
     JsonObject args = doc["args"];
@@ -680,6 +699,10 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       esp_ota_mark_app_valid_cancel_rollback();
       send_settings();  // in case the volume changed while offline
       send_status();
+      if (!update_checked) {  // once per boot
+        update_checked = true;
+        ws.sendTXT("{\"type\":\"update_check\"}");
+      }
       break;
     case WStype_DISCONNECTED:
       if (ws_connected) LOGW(TAG, "connection to Kotodama lost");
@@ -780,6 +803,15 @@ bool run_online() {
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
     update_sleep();
+    if (offer_install && offered_update) {
+      LOGI(TAG, "installing firmware %s from the screen", offered_update->version.c_str());
+      pending_update = std::move(offered_update);
+    } else if (offer_dismiss && offered_update) {
+      LOGI(TAG, "firmware %s dismissed", offered_update->version.c_str());
+      store::setDismissedUpdate(offered_update->version);
+      offered_update.reset();
+    }
+    offer_install = offer_dismiss = false;
     if (pending_update) {
       run_firmware_update();  // only returns if the update failed
       return true;

@@ -52,6 +52,11 @@ void identify();                       // blink the screen for a few seconds
 // Mic muted: while idle or sleeping, the character shows its muted animation and the ring turns orange.
 void setMuted(bool muted);
 
+// "Update available vX" with Install / Dismiss on top of the home screen, until hidden. The buttons call the
+// callbacks (on the UI task, UI locked) and hide the prompt.
+void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)());
+void hideUpdateOffer();
+
 // Touch on the home screen. A tap in the middle calls `on_tap`; dragging around the edge turns the volume up
 // (clockwise) or down, calling `on_volume` with the change in percent, which returns the new volume to display.
 // Both run on the UI task with the UI locked: keep them short.

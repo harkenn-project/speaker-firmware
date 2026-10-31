@@ -135,6 +135,16 @@ String takeUpdatedFrom() {
   return v;
 }
 
+String dismissedUpdate() {
+  Lock l;
+  return get("dismissed_fw", "");
+}
+
+void setDismissedUpdate(const String& version) {
+  Lock l;
+  prefs.putString("dismissed_fw", version);
+}
+
 void requestPortal() {
   Lock l;
   prefs.putBool("portal", true);

@@ -30,6 +30,10 @@ lv_timer_t* clock_timer = nullptr;
 lv_obj_t* flash = nullptr;
 lv_timer_t* flash_timer = nullptr;
 bool muted = false;
+String offer_version;  // non-empty while an update is offered
+void (*offer_install)() = nullptr;
+void (*offer_dismiss)() = nullptr;
+lv_obj_t* offer_panel = nullptr;
 lv_obj_t* progress_bar = nullptr;
 lv_obj_t* progress_detail = nullptr;
 String progress_title;
@@ -190,7 +194,7 @@ lv_obj_t* reset_screen() {
   lv_obj_clean(scr);
   ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
   touch_layer = volume_arc = volume_label = nullptr;
-  progress_bar = progress_detail = nullptr;
+  progress_bar = progress_detail = offer_panel = nullptr;
   progress_title = "";
   if (flash_timer) {
     lv_timer_delete(flash_timer);
@@ -296,6 +300,54 @@ void hide_volume(lv_timer_t* t) {
   lv_obj_add_flag(volume_arc, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(volume_label, LV_OBJ_FLAG_HIDDEN);
   lv_timer_pause(t);
+}
+
+// Update prompt
+
+lv_obj_t* offer_button(lv_obj_t* parent, const char* text, uint32_t bg, uint32_t fg, int x, void (*cb)()) {
+  lv_obj_t* b = lv_button_create(parent);
+  lv_obj_set_size(b, 84, 38);
+  lv_obj_set_pos(b, x, 78);
+  lv_obj_set_style_bg_color(b, color(bg), 0);
+  lv_obj_set_style_radius(b, 19, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_color(l, color(fg), 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(
+      b,
+      [](lv_event_t* e) {
+        auto fn = reinterpret_cast<void (*)()>(lv_event_get_user_data(e));
+        offer_version = "";
+        if (offer_panel) {
+          lv_obj_delete_async(offer_panel);  // we're inside one of its buttons' event handlers
+          offer_panel = nullptr;
+        }
+        if (fn) fn();
+      },
+      LV_EVENT_CLICKED, reinterpret_cast<void*>(cb));
+  return b;
+}
+
+void create_offer(lv_obj_t* scr) {
+  if (offer_panel || !offer_version.length()) return;
+  offer_panel = lv_obj_create(scr);
+  lv_obj_set_size(offer_panel, 200, 128);
+  lv_obj_set_pos(offer_panel, 20, 56);
+  lv_obj_set_style_bg_color(offer_panel, color(theme.surface), 0);
+  lv_obj_set_style_bg_opa(offer_panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(offer_panel, color(theme.primary), 0);
+  lv_obj_set_style_border_width(offer_panel, 2, 0);
+  lv_obj_set_style_radius(offer_panel, 20, 0);
+  lv_obj_set_style_pad_all(offer_panel, 0, 0);
+  lv_obj_remove_flag(offer_panel, LV_OBJ_FLAG_SCROLLABLE);
+  label(offer_panel, "Update available", &lv_font_montserrat_18, theme.text, 0, 12, 196, 24);
+  const String v = "v" + offer_version;
+  label(offer_panel, v.c_str(), &lv_font_montserrat_24, theme.primary, 0, 40, 196, 30);
+  offer_button(offer_panel, "Install", theme.primary, theme.background, 12, offer_install);
+  offer_button(offer_panel, "Dismiss", theme.background, theme.muted, 100, offer_dismiss);
 }
 
 void create_touch_layer(lv_obj_t* scr) {
@@ -486,7 +538,8 @@ void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24
     lv_obj_set_style_border_width(ring, ring_widget->thickness, 0);
     lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
   }
-  create_touch_layer(scr);  // last, so it is on top
+  create_touch_layer(scr);  // on top of the layout
+  create_offer(scr);        // and the update prompt above that
   update_clock();
   apply_state();
 }
@@ -511,6 +564,23 @@ void setMuted(bool m) {
   if (muted == m) return;
   muted = m;
   apply_state();
+}
+
+void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)()) {
+  Lock l;
+  if (offer_panel) lv_obj_delete(offer_panel);
+  offer_panel = nullptr;
+  offer_version = version;
+  offer_install = on_install;
+  offer_dismiss = on_dismiss;
+  if (touch_layer) create_offer(lv_screen_active());  // otherwise it appears with the home screen
+}
+
+void hideUpdateOffer() {
+  Lock l;
+  offer_version = "";
+  if (offer_panel) lv_obj_delete(offer_panel);
+  offer_panel = nullptr;
 }
 
 void onTouch(void (*on_tap)(), int (*on_volume)(int delta)) {
