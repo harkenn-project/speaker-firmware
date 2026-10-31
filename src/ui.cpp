@@ -19,10 +19,9 @@ bool clock_24h = true;
 String current_state = "idle";
 String status_text;
 CharacterSet character;
-lv_image_dsc_t gif_dsc[STATE_COUNT];
 
 lv_obj_t* ring = nullptr;
-lv_obj_t* gif = nullptr;
+lv_obj_t* anim_img = nullptr;  // the character widget
 lv_obj_t* clock_label = nullptr;
 lv_obj_t* date_label = nullptr;
 lv_obj_t* status_label = nullptr;
@@ -31,6 +30,128 @@ lv_obj_t* flash = nullptr;
 lv_timer_t* flash_timer = nullptr;
 
 lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
+
+// KANI animation player (format: kotodama/app/kani.py). Frames are decoded into one RGB565 frame buffer in PSRAM
+// that an lv_image displays; frame 0 is complete, later frames only carry changed pixels.
+
+uint16_t rd16(const uint8_t* p) { return p[0] | p[1] << 8; }
+uint32_t rd32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | static_cast<uint32_t>(p[3]) << 24; }
+
+struct Player {
+  std::shared_ptr<Blob> blob;
+  uint16_t w = 0, h = 0, frames = 0, index = 0;
+  uint16_t* fb = nullptr;
+  size_t fb_pixels = 0;
+  lv_image_dsc_t dsc{};
+  lv_timer_t* timer = nullptr;
+} player;
+
+bool kani_valid(const Blob& b, uint16_t& w, uint16_t& h, uint16_t& n) {
+  if (b.size < 12 || memcmp(b.data, "KANI", 4) != 0 || b.data[4] != 1) return false;
+  w = rd16(b.data + 6);
+  h = rd16(b.data + 8);
+  n = rd16(b.data + 10);
+  return w && h && n && w <= board::SCREEN_SIZE && h <= board::SCREEN_SIZE && 12 + 10u * n <= b.size;
+}
+
+uint16_t kani_frame_ms(const Blob& b, uint16_t i) { return max<uint16_t>(20, rd16(b.data + 12 + 10 * i)); }
+
+bool kani_decode(const Blob& b, uint16_t i, uint16_t* fb, size_t total) {
+  const uint32_t off = rd32(b.data + 12 + 10 * i + 2), len = rd32(b.data + 12 + 10 * i + 6);
+  if (off > b.size || len > b.size - off) return false;
+  const uint8_t* p = b.data + off;
+  const uint8_t* end = p + len;
+  size_t px = 0;
+  while (p < end) {
+    const uint8_t op = *p++;
+    uint32_t count = op & 0x3F;
+    if (count == 0x3F) {
+      if (end - p < 2) return false;
+      count += rd16(p);
+      p += 2;
+    }
+    count += 1;
+    if (px + count > total) return false;
+    switch (op >> 6) {
+      case 0:  // skip
+        if (i == 0) return false;
+        break;
+      case 1: {  // run
+        if (end - p < 2) return false;
+        const uint16_t c = rd16(p);
+        p += 2;
+        for (uint32_t k = 0; k < count; k++) fb[px + k] = c;
+        break;
+      }
+      case 2:  // literal
+        if (static_cast<size_t>(end - p) < 2 * count) return false;
+        memcpy(fb + px, p, 2 * count);
+        p += 2 * count;
+        break;
+      default:
+        return false;
+    }
+    px += count;
+  }
+  return px == total;
+}
+
+void player_stop() {
+  if (player.timer) lv_timer_delete(player.timer);
+  player.timer = nullptr;
+  player.blob.reset();
+}
+
+void player_tick(lv_timer_t* t) {
+  if (!player.blob || !anim_img) return;
+  player.index = (player.index + 1) % player.frames;
+  if (!kani_decode(*player.blob, player.index, player.fb, player.fb_pixels)) {
+    player_stop();
+    return;
+  }
+  lv_image_cache_drop(&player.dsc);
+  lv_obj_invalidate(anim_img);
+  lv_timer_set_period(t, kani_frame_ms(*player.blob, player.index));
+}
+
+void player_play(const std::shared_ptr<Blob>& blob) {
+  if (!anim_img || blob == player.blob) return;
+  player_stop();
+  uint16_t w, h, n;
+  if (!blob || !kani_valid(*blob, w, h, n)) {
+    lv_obj_add_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  const size_t pixels = static_cast<size_t>(w) * h;
+  if (pixels != player.fb_pixels) {
+    heap_caps_free(player.fb);
+    player.fb = static_cast<uint16_t*>(heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM));
+    player.fb_pixels = player.fb ? pixels : 0;
+    if (!player.fb) return;
+  }
+  if (!kani_decode(*blob, 0, player.fb, pixels)) {
+    lv_obj_add_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  player.blob = blob;
+  player.w = w;
+  player.h = h;
+  player.frames = n;
+  player.index = 0;
+  player.dsc = {};
+  player.dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+  player.dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+  player.dsc.header.w = w;
+  player.dsc.header.h = h;
+  player.dsc.header.stride = w * 2;
+  player.dsc.data = reinterpret_cast<const uint8_t*>(player.fb);
+  player.dsc.data_size = pixels * 2;
+  lv_image_cache_drop(&player.dsc);
+  lv_image_set_src(anim_img, &player.dsc);
+  lv_obj_remove_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(anim_img);
+  if (n > 1) player.timer = lv_timer_create(player_tick, kani_frame_ms(*blob, 0), nullptr);
+}
 
 const lv_font_t* font(const String& size) {
   if (size == "sm") return &lv_font_montserrat_14;
@@ -42,8 +163,9 @@ const lv_font_t* font(const String& size) {
 // Removes everything from the screen and paints the theme background.
 lv_obj_t* reset_screen() {
   lv_obj_t* scr = lv_screen_active();
+  player_stop();
   lv_obj_clean(scr);
-  ring = gif = clock_label = date_label = status_label = flash = nullptr;
+  ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
   if (flash_timer) {
     lv_timer_delete(flash_timer);
     flash_timer = nullptr;
@@ -112,15 +234,10 @@ void apply_state() {
   if (status_label) {
     lv_label_set_text(status_label, status_text.length() ? status_text.c_str() : default_status(current_state));
   }
-  if (gif) {
+  if (anim_img) {
     int i = stateIndex(current_state.c_str());
     if (i < 0 || !character[i]) i = 0;
-    if (character[i]) {
-      lv_gif_set_src(gif, &gif_dsc[i]);
-      lv_obj_remove_flag(gif, LV_OBJ_FLAG_HIDDEN);
-    } else {
-      lv_obj_add_flag(gif, LV_OBJ_FLAG_HIDDEN);
-    }
+    player_play(character[i]);
   }
 }
 
@@ -205,8 +322,10 @@ void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24
     if (w.type == "ring") {
       ring_widget = &w;  // drawn last, on top of the (opaque) character
     } else if (w.type == "character") {
-      gif = lv_gif_create(scr);
-      lv_obj_set_pos(gif, w.x, w.y);
+      anim_img = lv_image_create(scr);
+      lv_obj_set_pos(anim_img, w.x, w.y);
+      lv_obj_set_size(anim_img, w.w, w.h);
+      lv_obj_add_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
     } else if (w.type == "clock") {
       clock_label = label(scr, "", font(w.font), theme.text, w.x, w.y, w.w, w.h);
     } else if (w.type == "date") {
@@ -230,17 +349,7 @@ void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24
 
 void setCharacter(const CharacterSet& set) {
   Lock l;
-  // Point the descriptors at the new data before the old blobs are released (when `character` is replaced).
-  for (size_t i = 0; i < STATE_COUNT; i++) {
-    gif_dsc[i] = {};
-    if (!set[i]) continue;
-    gif_dsc[i].header.magic = LV_IMAGE_HEADER_MAGIC;
-    gif_dsc[i].header.cf = LV_COLOR_FORMAT_RAW_ALPHA;
-    gif_dsc[i].data = set[i]->data;
-    gif_dsc[i].data_size = set[i]->size;
-  }
-  CharacterSet old = character;
-  character = set;
+  character = set;  // the player keeps its own reference to the blob it is showing until it switches
   apply_state();
 }
 

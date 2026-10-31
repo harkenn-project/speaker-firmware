@@ -4,14 +4,14 @@ Firmware for the Spotpear ESP32-S3 1.28" BOX: ESP32-S3 N16R8, a GC9A01 240×240 
 ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9 and LovyanGFX. It speaks the
 protocol in [../docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
-## What it does (v0.1)
+## What it does (v0.2)
 
 1. **Wi-Fi.** With no saved network, it opens the access point `Kotodama-XXXX`. Join it, and a page at
    `http://192.168.4.1` lets you pick a network. The page has an *Advanced* field for the server URL, which defaults
    to `https://kotodama.mylife.ninja`. Networks pushed from Kotodama are added to the saved list and never removed.
 2. **Find the server.** It polls `/api/v1/ping` until Kotodama answers, and sets its clock from the reply.
 3. **Adoption.** It shows a 3-digit code. You enter the code in Kotodama, and the device saves its token in NVS.
-4. **Online.** It loads its config, downloads the character GIFs at the size the layout needs, and draws the layout.
+4. **Online.** It loads its config, downloads the character animations (KANI, see `app/kani.py`) at the size the layout needs, and draws the layout.
    It then holds a WebSocket to Kotodama:
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.

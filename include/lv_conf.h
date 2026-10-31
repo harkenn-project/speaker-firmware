@@ -13,7 +13,8 @@
 #define LV_DEF_REFR_PERIOD 20
 #define LV_USE_LOG 0
 
-#define LV_USE_GIF 1
+/* Character animations use our own KANI player (src/ui.cpp), not LVGL's GIF decoder. */
+#define LV_USE_GIF 0
 
 /* Font sizes used by layouts: sm 14, md 18, lg 28, xl 48 */
 #define LV_FONT_MONTSERRAT_14 1

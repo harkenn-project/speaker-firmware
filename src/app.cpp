@@ -77,6 +77,7 @@ bool ws_connected = false;
 uint32_t ws_down_since = 0;
 String pending_config;  // config received over the socket, applied from the main loop
 bool first_ws_config = false;
+String applied_key;  // config_key() of the config on screen
 bool want_config = false;
 uint32_t last_status = 0, last_log_flush = 0;
 String play_state_restore;
@@ -263,6 +264,14 @@ bool adopt() {
 
 // Configuration
 
+// Identifies what a config would change: the version, plus the character manifest (its URLs carry the asset
+// version and background colour, which can change with a server upgrade even when the config version does not).
+String config_key(JsonDocument& doc) {
+  String key = String(doc["version"] | 0) + "|";
+  serializeJson(doc["character"], key);
+  return key;
+}
+
 uint32_t hex_color(JsonVariantConst v, uint32_t fallback) {
   const char* s = v | "";
   return (s[0] == '#' && strlen(s) == 7) ? strtoul(s + 1, nullptr, 16) : fallback;
@@ -343,6 +352,7 @@ void apply_config(JsonDocument& doc) {
   board::markActivity();
   board::setBrightness(brightness);
   config_version = doc["version"] | 0;
+  applied_key = config_key(doc);
   LOGI(TAG, "applied config v%d (layout %s, character %s)", config_version, (const char*)(doc["layout"]["id"] | "?"),
        (const char*)(doc["character"]["id"] | "?"));
 }
@@ -490,9 +500,11 @@ bool run_online() {
       pending_config = "";
       // The socket always opens with the current config, which was usually just fetched over HTTP: skip that one
       // if nothing changed. Later pushes (including "Resend config") are always applied.
-      const bool skip = first_ws_config && !deserializeJson(doc, raw) && (doc["version"] | 0) == config_version;
+      if (!deserializeJson(doc, raw)) {
+        const bool skip = first_ws_config && config_key(doc) == applied_key;
+        if (!skip) apply_config(doc);
+      }
       first_ws_config = false;
-      if (!skip && !deserializeJson(doc, raw)) apply_config(doc);
       send_status();
     }
     if (want_config && ws_connected) {
