@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMAGE = ROOT / ".pio/build/harkenn-speaker/firmware.bin"
 WORKTREE = ROOT / ".releases"
 BRANCH = "releases"
-MARKER = re.compile(rb"(?:HARKENN|KOTODAMA)-FW\|([0-9A-Za-z.+_-]{1,32})\|([0-9A-Za-z._-]{1,64})\|")
+MARKER = re.compile(rb"HARKENN-FW\|([0-9A-Za-z.+_-]{1,32})\|([0-9A-Za-z._-]{1,64})\|")
 
 
 def git(*args: str, cwd: Path = ROOT, check: bool = True) -> subprocess.CompletedProcess:

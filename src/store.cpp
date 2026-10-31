@@ -15,7 +15,7 @@ struct Lock {
 
 void begin() {
   mutex = xSemaphoreCreateMutex();
-  prefs.begin("kotodama", false);  // the project's old name: kept so saved settings survive
+  prefs.begin("harkenn", false);
 }
 
 // Preferences logs an error for every missing key, so check first.
@@ -23,22 +23,35 @@ String get(const char* key, const char* fallback) {
   return prefs.isKey(key) ? prefs.getString(key, fallback) : String(fallback);
 }
 
-// Firmware before 0.7 had this server built in and didn't save it, so a speaker adopted then implies it.
-constexpr const char* PRE_07_SERVER_URL = "https://kotodama.mylife.ninja";
-
-String serverUrl() {
-  Lock l;
-  const bool adopted_before_07 = !prefs.isKey("server") && prefs.isKey("token");
-  String url = get("server", adopted_before_07 ? PRE_07_SERVER_URL : "");
+String clean_url(String url) {
   url.trim();
   while (url.endsWith("/")) url.remove(url.length() - 1);
   return url;
 }
 
+void put_or_remove(const char* key, const String& value) {
+  if (value.length()) prefs.putString(key, value);
+  else if (prefs.isKey(key)) prefs.remove(key);
+}
+
+String serverUrl() {
+  Lock l;
+  return clean_url(get("server", ""));
+}
+
 void setServerUrl(const String& url) {
   Lock l;
-  if (url.length()) prefs.putString("server", url);
-  else if (prefs.isKey("server")) prefs.remove("server");
+  put_or_remove("server", clean_url(url));
+}
+
+String announcedServerUrl() {
+  Lock l;
+  return clean_url(get("server_alt", ""));
+}
+
+void setAnnouncedServerUrl(const String& url) {
+  Lock l;
+  put_or_remove("server_alt", clean_url(url));
 }
 
 String token() {

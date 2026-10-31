@@ -13,8 +13,13 @@ constexpr size_t MAX_WIFI = 8;
 
 void begin();
 
-String serverUrl();  // saved server URL, or empty: the speaker then looks for its server (app.cpp)
-void setServerUrl(const String& url);  // empty forgets it
+// The server's address: entered on the setup page, or the one the speaker was adopted through. Empty: the speaker
+// looks for its server (app.cpp). Setting an empty string forgets it.
+String serverUrl();
+void setServerUrl(const String& url);
+// The public address the server announces in its config: tried second, so a wrong value can't strand the speaker.
+String announcedServerUrl();
+void setAnnouncedServerUrl(const String& url);
 
 String token();
 void setToken(const String& token);

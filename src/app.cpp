@@ -307,6 +307,7 @@ std::vector<String> server_candidates() {
     if (url.length() && std::find(out.begin(), out.end(), url) == out.end()) out.push_back(url);
   };
   add(store::serverUrl());
+  add(store::announcedServerUrl());
   const int found = MDNS.queryService("harkenn", "tcp");
   for (int i = 0; i < found; i++) {
     add(MDNS.txt(i, "url"));
@@ -326,7 +327,7 @@ bool ping_server() {
   JsonDocument doc;
   if (code != 200 || deserializeJson(doc, body)) return false;
   const String name = doc["server"] | "";
-  if (name != "harkenn" && name != "kotodama") return false;  // some other web server answering on that name
+  if (name != "harkenn") return false;  // some other web server answering on that name
   const double t = doc["time"] | 0.0;
   if (time(nullptr) < 1700000000 && t > 1.7e9) {  // set the clock now rather than waiting for NTP
     timeval tv{static_cast<time_t>(t), 0};
@@ -501,11 +502,12 @@ void apply_config(JsonDocument& doc) {
   board::markActivity();
   board::setBrightness(brightness);
   config_version = doc["version"] | 0;
-  // Where the server says it lives: saved so the speaker finds it again (e.g. after the server moves).
-  const String home = doc["server_url"] | "";
-  if ((home.startsWith("http://") || home.startsWith("https://")) && home != store::serverUrl()) {
-    store::setServerUrl(home);
-    LOGI(TAG, "server address saved: %s", home.c_str());
+  // The server's public address: remembered as a second way to reach it (the adoption address stays first).
+  const String announced = doc["server_url"] | "";
+  if ((announced.startsWith("http://") || announced.startsWith("https://")) &&
+      announced != store::announcedServerUrl()) {
+    store::setAnnouncedServerUrl(announced);
+    LOGI(TAG, "server's public address: %s", announced.c_str());
   }
   applied_key = config_key(doc);
   LOGI(TAG, "applied config v%d (layout %s, character %s)", config_version, (const char*)(doc["layout"]["id"] | "?"),

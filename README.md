@@ -73,3 +73,10 @@ To restore the stock XiaoZhi firmware, write the full backup back to address 0 w
 ## Credits
 
 Built with LVGL, LovyanGFX, the ESP32 Arduino core and more: see [CREDITS.md](CREDITS.md).
+
+Created and maintained by **Master Magic**, with the Harkenn contributors.
+
+## Licence
+
+[MIT](LICENSE), copyright the Harkenn contributors. The libraries compiled in keep their own licences (see
+[CREDITS.md](CREDITS.md)); the LGPL ones can be rebuilt and relinked from this source.
