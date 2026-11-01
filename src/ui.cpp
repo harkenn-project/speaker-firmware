@@ -237,7 +237,7 @@ uint32_t ring_color(const String& state) {
   if (state == "muted") return 0xff9640;
   if (state == "listening") return theme.primary;
   if (state == "thinking") return theme.muted;
-  if (state == "speaking") return theme.accent;
+  if (state == "speaking" || state == "ringing") return theme.accent;
   if (state == "error") return 0xff5d5d;
   if (state == "sleeping") return theme.background;
   return theme.surface;
@@ -248,6 +248,7 @@ const char* default_status(const String& state) {
   if (state == "thinking") return "Thinking...";
   if (state == "error") return "Something went wrong";
   if (state == "muted") return "Mic off";
+  if (state == "ringing") return "Tap to answer";
   return "";
 }
 

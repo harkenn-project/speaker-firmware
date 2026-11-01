@@ -763,7 +763,7 @@ void start_ringing(const String& id, uint32_t seconds) {
   ring_until = millis() + constrain(seconds, 5u, 30u) * 1000;
   ring_next = millis();
   board::markActivity();  // wake the screen
-  ui::setState("listening");
+  ui::setState("ringing");  // the character's ringing animation (idle if it has none)
   ui::setStatusText("Tap to answer");
   status_text_until = 0;
   LOGI(TAG, "ringing for %u s", seconds);
@@ -787,8 +787,7 @@ void handle_tap() {
     doc["ring"] = ring_id;
     send_json(doc);
     LOGI(TAG, "answered a ring");
-    stop_ringing();
-    audio::play(audio::Sound::Done);
+    stop_ringing();  // no chime: the caller's message follows straight away
     ui::setState("thinking");  // until Harkenn speaks, or the ring ends
     return;
   }

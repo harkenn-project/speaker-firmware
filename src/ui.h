@@ -9,8 +9,9 @@
 namespace ui {
 
 // Character states, in the order used by CharacterSet.
-constexpr const char* STATES[] = {"idle", "listening", "thinking", "speaking", "sleeping", "error", "muted"};
-constexpr size_t STATE_COUNT = 7;
+constexpr const char* STATES[] = {"idle", "listening", "thinking", "speaking", "sleeping", "error", "muted",
+                                  "ringing"};
+constexpr size_t STATE_COUNT = 8;
 int stateIndex(const char* state);  // -1 if unknown
 
 struct Blob {  // a downloaded file (KANI animation) held in PSRAM
