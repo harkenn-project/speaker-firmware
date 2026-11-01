@@ -2,8 +2,8 @@
 
 Firmware for the Spotpear ESP32-S3 1.28" BOX: ESP32-S3 N16R8, a GC9A01 240×240 round display, CST816D touch and an
 ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9 and LovyanGFX. It speaks the
-protocol in [docs/PROTOCOL.md](https://gitlab.com/harkenn/harkenn-dockerserver/-/blob/main/docs/PROTOCOL.md) of
-[harkenn-dockerserver](https://gitlab.com/harkenn/harkenn-dockerserver), the server it talks to.
+protocol in [docs/PROTOCOL.md](https://github.com/harkenn-project/server-docker/blob/main/docs/PROTOCOL.md) of
+[server-docker](https://github.com/harkenn-project/server-docker), the server it talks to.
 
 ## What it does (v0.6)
 
@@ -74,7 +74,13 @@ To restore the stock XiaoZhi firmware, write the full backup back to address 0 w
 
 Built with LVGL, LovyanGFX, the ESP32 Arduino core and more: see [CREDITS.md](CREDITS.md).
 
-Created and maintained by **Master Magic**, with the Harkenn contributors.
+Created by **Master Magic** and **Claude** (Anthropic's AI), with the Harkenn contributors.
+
+## Support
+
+Buy us a coffee on [GitHub Sponsors](https://github.com/sponsors/harkenn-project). Half of every donation goes to the
+open-source projects Harkenn is built on; see
+[SUPPORT.md](https://github.com/harkenn-project/server-docker/blob/main/SUPPORT.md).
 
 ## Licence
 

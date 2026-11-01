@@ -58,7 +58,7 @@ struct Gesture {
 
 lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
 
-// KANI animation player (format: app/kani.py in harkenn-dockerserver). Frames are decoded into one RGB565 frame buffer in PSRAM
+// KANI animation player (format: app/kani.py in server-docker). Frames are decoded into one RGB565 frame buffer in PSRAM
 // that an lv_image displays; frame 0 is complete, later frames only carry changed pixels.
 
 uint16_t rd16(const uint8_t* p) { return p[0] | p[1] << 8; }

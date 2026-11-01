@@ -33,4 +33,4 @@ The firmware's full source is in this repository, so the LGPL libraries can be r
 ## Formats and protocols
 
 The KANI animation format and the device protocol are this project's own: see `app/kani.py` and `docs/PROTOCOL.md`
-in [harkenn-dockerserver](https://gitlab.com/harkenn/harkenn-dockerserver).
+in [server-docker](https://github.com/harkenn-project/server-docker).
