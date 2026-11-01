@@ -115,6 +115,7 @@ enum class Voice { Off, Starting, Listening, Waiting, Speaking };
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
 uint32_t voice_session = 0;
+bool server_heard_speech = false;  // Harkenn ended listening (listen_stop): it heard speech
 size_t speech_dropped = 0;
 
 String ap_name() {
@@ -617,6 +618,7 @@ void start_voice() {
   if (t > 1700000000) doc["local_time"] = now;
   send_json(doc);
   voice = Voice::Listening;
+  server_heard_speech = false;
 }
 
 // Sends what the mic has queued; when listening has stopped, ends the utterance.
@@ -629,7 +631,7 @@ void pump_mic() {
   if (audio::micMuted()) {  // muted mid-sentence: drop it
     send_voice("voice_cancel");
     voice_done();
-  } else if (!info.speech) {
+  } else if (!info.speech && !server_heard_speech) {
     LOGI(TAG, "heard nothing in %u ms (noise floor %d, peak %d%%)", info.duration_ms, info.noise_floor,
          info.peak_percent);
     send_voice("voice_cancel");
@@ -686,7 +688,10 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
     return;
   }
   if (String(doc["session"] | "") != String(voice_session)) return;  // about an utterance we've given up on
-  if (type == "voice_result") {
+  if (type == "listen_stop" && voice == Voice::Listening) {  // Harkenn heard speech, then silence
+    server_heard_speech = true;
+    audio::stopListening();  // pump_mic() ends the utterance
+  } else if (type == "voice_result") {
     const String heard = doc["heard"] | "";
     if (!heard.length() && voice == Voice::Waiting) {
       audio::play(audio::Sound::Cancel);
@@ -750,7 +755,7 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     ws.sendTXT("{\"type\":\"pong\"}");
-  } else if (type.startsWith("speak_") || type.startsWith("voice_")) {
+  } else if (type.startsWith("speak_") || type.startsWith("voice_") || type == "listen_stop") {
     handle_voice_message(type, doc);
   } else if (type == "update_available") {
     JsonObject f = doc["firmware"];
