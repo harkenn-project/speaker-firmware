@@ -117,6 +117,15 @@ enum class Voice { Off, Starting, Listening, Waiting, Speaking };
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
 uint32_t voice_session = 0;
+// The boot sound waits until the first config is fully in: every animation and sound downloaded, the boot sound too.
+bool boot_sound_played = false;
+
+void play_boot_sound() {
+  if (boot_sound_played) return;
+  boot_sound_played = true;
+  audio::play(audio::Sound::Boot);
+}
+
 bool server_heard_speech = false;  // Harkenn ended listening (listen_stop): it heard speech
 bool listen_after_speech = false;  // speak_start {listen}: someone asked a question; listen when it's been said
 bool follow_up_next = false;       // ...and the reply continues the conversation (speak_start {follow_up})
@@ -542,6 +551,7 @@ void apply_config(JsonDocument& doc) {
   shown = set;
   ui::setCharacter(set);
   ui::showLayout(theme, widgets, display["clock_24h"] | true);
+  if (complete) play_boot_sound();  // else when a retry has everything
   dimmed = false;
   board::markActivity();
   board::setBrightness(brightness);
@@ -1157,7 +1167,6 @@ void main_task(void*) {
   if (audio::begin()) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());
-    audio::play(audio::Sound::Boot);
   }
   ui::setMuted(audio::micMuted());
   ui::onTouch([] { tap_requested = true; },
