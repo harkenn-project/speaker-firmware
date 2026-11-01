@@ -8,7 +8,7 @@ namespace audio {
 constexpr int SAMPLE_RATE = 16000;
 
 // Built-in sounds, synthesized on the speaker.
-enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick };
+enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring };
 
 bool begin();  // false if the codec doesn't answer
 

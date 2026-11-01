@@ -37,6 +37,7 @@ constexpr uint32_t WS_GIVE_UP_MS = 30000;  // then re-check the token over HTTP
 constexpr size_t MAX_ASSET_BYTES = 3 * 1024 * 1024;
 constexpr uint32_t MAX_LISTEN_MS = 30000;
 constexpr uint32_t REPLY_TIMEOUT_MS = 60000;  // the first answer can be slow while Harkenn loads its models
+constexpr uint32_t RING_EVERY_MS = 3000;  // how often the ring repeats while ringing
 constexpr uint32_t CHIME_MS = 350;          // start listening after the activation chime, so it isn't sent
 constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
 
@@ -116,6 +117,9 @@ Voice voice = Voice::Off;
 uint32_t voice_at = 0;
 uint32_t voice_session = 0;
 bool server_heard_speech = false;  // Harkenn ended listening (listen_stop): it heard speech
+bool listen_after_speech = false;  // speak_start {listen}: someone asked a question; listen when it's been said
+String ring_id;                    // ringing for an agent (ring): tap to answer
+uint32_t ring_until = 0, ring_next = 0;
 size_t speech_dropped = 0;
 
 String ap_name() {
@@ -648,7 +652,43 @@ void pump_mic() {
   }
 }
 
+void stop_ringing() {
+  ring_id = "";
+  ui::setStatusText("");
+  status_text_until = 0;
+}
+
+void start_ringing(const String& id, uint32_t seconds) {
+  if (voice != Voice::Off) return;  // in a conversation already: not answered, Harkenn tells the agent
+  ring_id = id;
+  ring_until = millis() + constrain(seconds, 5u, 30u) * 1000;
+  ring_next = millis();
+  board::markActivity();  // wake the screen
+  ui::setState("listening");
+  ui::setStatusText("Tap to answer");
+  status_text_until = 0;
+  LOGI(TAG, "ringing for %u s", seconds);
+}
+
+void start_listening_turn() {
+  audio::play(audio::Sound::Activate);
+  ui::setState("listening");
+  voice = Voice::Starting;
+  voice_at = millis() + CHIME_MS;
+}
+
 void handle_tap() {
+  if (ring_id.length()) {  // answer
+    JsonDocument doc;
+    doc["type"] = "ring_answer";
+    doc["ring"] = ring_id;
+    send_json(doc);
+    LOGI(TAG, "answered a ring");
+    stop_ringing();
+    audio::play(audio::Sound::Done);
+    ui::setState("thinking");  // until Harkenn speaks, or the ring ends
+    return;
+  }
   if (voice == Voice::Listening) {
     audio::stopListening();  // pump_mic() ends the utterance
   } else if (voice == Voice::Starting || voice == Voice::Waiting) {
@@ -658,6 +698,7 @@ void handle_tap() {
   } else if (voice == Voice::Speaking) {
     audio::stopSpeech();
     send_voice("speak_stop");
+    listen_after_speech = false;
     voice_done();
   } else if (audio::micMuted()) {
     audio::play(audio::Sound::Cancel);
@@ -666,16 +707,28 @@ void handle_tap() {
     audio::play(audio::Sound::Error);
     show_status_text("Not connected", 2500);
   } else if (strcmp(ui::state(), "idle") == 0 || strcmp(ui::state(), "sleeping") == 0) {
-    audio::play(audio::Sound::Activate);
-    ui::setState("listening");
-    voice = Voice::Starting;
-    voice_at = millis() + CHIME_MS;
+    start_listening_turn();
   }
 }
 
 // Messages from Harkenn about the current utterance.
 void handle_voice_message(const String& type, JsonDocument& doc) {
-  if (type == "speak_start") {  // a reply, or something Harkenn wants said (admin "Say it")
+  if (type == "ring") {
+    start_ringing(doc["ring"] | "", doc["seconds"] | 30);
+    return;
+  }
+  if (type == "ring_stop") {
+    if (ring_id.length() && ring_id == String(doc["ring"] | "")) {  // time's up, or answered on another speaker
+      stop_ringing();
+      voice_done();
+    } else if (!ring_id.length() && voice == Voice::Off && strcmp(ui::state(), "thinking") == 0) {
+      voice_done();  // answered here; nothing more to say
+    }
+    return;
+  }
+  if (type == "speak_start") {  // a reply, or something Harkenn wants said (admin "Say it", an agent)
+    if (ring_id.length()) stop_ringing();
+    listen_after_speech = doc["listen"] | false;
     audio::startSpeech();
     speech_dropped = 0;
     voice = Voice::Speaking;
@@ -688,7 +741,9 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
     return;
   }
   if (String(doc["session"] | "") != String(voice_session)) return;  // about an utterance we've given up on
-  if (type == "listen_stop" && voice == Voice::Listening) {  // Harkenn heard speech, then silence
+  if (type == "voice_wait" && voice == Voice::Waiting) {  // the answer is taking a while (an agent using tools)
+    voice_at = millis() + REPLY_TIMEOUT_MS;
+  } else if (type == "listen_stop" && voice == Voice::Listening) {  // Harkenn heard speech, then silence
     server_heard_speech = true;
     audio::stopListening();  // pump_mic() ends the utterance
   } else if (type == "voice_result") {
@@ -721,7 +776,27 @@ void update_voice() {
     send_voice("voice_cancel");
     voice_failed("no answer from Harkenn");
   } else if (voice == Voice::Speaking && !audio::speaking()) {
-    voice_done();
+    if (listen_after_speech) {  // a question was asked: listen for the answer
+      listen_after_speech = false;
+      if (audio::micMuted()) {
+        send_voice("voice_cancel");
+        voice_done();
+        show_status_text("Mic is off", 2500);
+      } else {
+        start_listening_turn();
+      }
+    } else {
+      voice_done();
+    }
+  }
+  if (ring_id.length()) {
+    if (static_cast<int32_t>(millis() - ring_until) >= 0) {
+      stop_ringing();
+      voice_done();
+    } else if (static_cast<int32_t>(millis() - ring_next) >= 0) {
+      audio::play(audio::Sound::Ring);
+      ring_next += RING_EVERY_MS;
+    }
   }  if (status_text_until && static_cast<int32_t>(millis() - status_text_until) >= 0) {
     status_text_until = 0;
     ui::setStatusText("");
@@ -755,7 +830,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     ws.sendTXT("{\"type\":\"pong\"}");
-  } else if (type.startsWith("speak_") || type.startsWith("voice_") || type == "listen_stop") {
+  } else if (type.startsWith("speak_") || type.startsWith("voice_") || type.startsWith("ring") ||
+             type == "listen_stop") {
     handle_voice_message(type, doc);
   } else if (type == "update_available") {
     JsonObject f = doc["firmware"];

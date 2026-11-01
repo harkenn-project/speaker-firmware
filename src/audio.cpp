@@ -121,6 +121,11 @@ constexpr Note ERROR_[] = {{220, 140, 50}, {0, 60, 0}, {208, 260, 50}, {0, 0, 0}
 constexpr Note MUTE_ON[] = {{659, 90, 45}, {440, 220, 45}, {0, 0, 0}};
 constexpr Note MUTE_OFF[] = {{440, 90, 45}, {659, 220, 45}, {0, 0, 0}};
 constexpr Note TICK[] = {{1500, 22, 25}, {0, 0, 0}};
+// A phone-like trill, played every RING_EVERY_MS while a speaker rings (app.cpp).
+constexpr Note RING[] = {{1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55},
+                         {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {0, 180, 0}, {1047, 55, 55},
+                         {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55},
+                         {1047, 55, 55}, {1319, 55, 55}, {0, 0, 0}};
 
 const Note* notes_for(Sound s) {
   switch (s) {
@@ -132,6 +137,7 @@ const Note* notes_for(Sound s) {
     case Sound::MuteOn: return MUTE_ON;
     case Sound::MuteOff: return MUTE_OFF;
     case Sound::Tick: return TICK;
+    case Sound::Ring: return RING;
   }
   return TICK;
 }
