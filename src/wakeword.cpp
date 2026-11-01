@@ -175,6 +175,9 @@ bool begin() {
   frontend_ok = FrontendPopulateState(&config, &frontend, SAMPLE_RATE);
   if (!frontend_ok) LOGE(TAG, "audio frontend failed");
   xTaskCreatePinnedToCore(task, "wakeword", 8192, nullptr, 3, nullptr, 0);
+  LOGI(TAG, "wake word ready; internal RAM free %u (largest block %u)",
+       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
   return frontend_ok;
 }
 
@@ -182,8 +185,9 @@ bool load(const uint8_t* data, size_t size, float cutoff, int window, size_t are
   auto* m = new Model();
   m->data = static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM));
   arena += 8 * 1024;  // headroom for this TFLM build
-  m->arena = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  if (!m->arena) m->arena = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM));
+  // PSRAM, not internal RAM: HTTPS needs the internal RAM (each TLS connection takes tens of KB), and with the arena
+  // there no secure connection could be made at all. The model runs fast enough from PSRAM.
+  m->arena = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM));
   if (!m->data || !m->arena) {
     LOGE(TAG, "out of memory for the wake word model");
     free_model(m);
@@ -221,9 +225,11 @@ bool load(const uint8_t* data, size_t size, float cutoff, int window, size_t are
   reset_stream();
   xSemaphoreGive(lock);
   free_model(old);
-  LOGI(TAG, "wake word model loaded: %u bytes, stride %d, cutoff %.2f over %d, arena %u used of %u",
-       static_cast<unsigned>(size), m->stride, cutoff, m->window,
-       static_cast<unsigned>(m->interpreter->arena_used_bytes()), static_cast<unsigned>(arena));
+  LOGI(TAG, "wake word model loaded: %u bytes, stride %d, cutoff %.2f over %d, arena %u used of %u; internal RAM "
+       "free %u (largest block %u)", static_cast<unsigned>(size), m->stride, cutoff, m->window,
+       static_cast<unsigned>(m->interpreter->arena_used_bytes()), static_cast<unsigned>(arena),
+       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
   return true;
 }
 
