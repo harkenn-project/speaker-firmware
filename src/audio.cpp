@@ -122,6 +122,7 @@ constexpr Note ERROR_[] = {{220, 140, 50}, {0, 60, 0}, {208, 260, 50}, {0, 0, 0}
 constexpr Note MUTE_ON[] = {{659, 90, 45}, {440, 220, 45}, {0, 0, 0}};
 constexpr Note MUTE_OFF[] = {{440, 90, 45}, {659, 220, 45}, {0, 0, 0}};
 constexpr Note TICK[] = {{1500, 22, 25}, {0, 0, 0}};
+constexpr Note LISTEN[] = {{988, 45, 28}, {1319, 80, 30}, {0, 0, 0}};
 constexpr Note SHUTDOWN[] = {{1047, 90, 45}, {784, 90, 45}, {659, 90, 45}, {523, 320, 45}, {0, 0, 0}};
 // A phone-like trill, played every RING_EVERY_MS while a speaker rings (app.cpp).
 constexpr Note RING[] = {{1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55},
@@ -141,6 +142,7 @@ const Note* notes_for(Sound s) {
     case Sound::Tick: return TICK;
     case Sound::Ring: return RING;
     case Sound::Shutdown: return SHUTDOWN;
+    case Sound::Listen: return LISTEN;
   }
   return TICK;
 }

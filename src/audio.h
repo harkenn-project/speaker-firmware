@@ -9,7 +9,8 @@ constexpr int SAMPLE_RATE = 16000;
 
 // Sounds. Boot, Activate, Done, Error and Shutdown are the sound pack's slots (boot, wake, done, error, shutdown):
 // a clip from Harkenn if one is stored (an empty clip is silence), else synthesized on the speaker like the rest.
-enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring, Shutdown };
+enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring, Shutdown,
+                             Listen };  // Listen: a soft cue when it listens for a reply
 
 bool begin();  // false if the codec doesn't answer
 

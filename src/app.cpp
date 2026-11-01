@@ -119,6 +119,8 @@ uint32_t voice_at = 0;
 uint32_t voice_session = 0;
 bool server_heard_speech = false;  // Harkenn ended listening (listen_stop): it heard speech
 bool listen_after_speech = false;  // speak_start {listen}: someone asked a question; listen when it's been said
+bool follow_up_next = false;       // ...and the reply continues the conversation (speak_start {follow_up})
+bool follow_up_turn = false;       // this utterance is a reply in an ongoing conversation
 String ring_id;                    // ringing for an agent (ring): tap to answer
 uint32_t ring_until = 0, ring_next = 0;
 size_t speech_dropped = 0;
@@ -672,6 +674,7 @@ void start_voice() {
   doc["session"] = String(voice_session);
   doc["rate"] = audio::SAMPLE_RATE;
   if (t > 1700000000) doc["local_time"] = now;
+  if (follow_up_turn) doc["follow_up"] = true;
   send_json(doc);
   voice = Voice::Listening;
   server_heard_speech = false;
@@ -691,7 +694,7 @@ void pump_mic() {
     LOGI(TAG, "heard nothing in %u ms (noise floor %d, peak %d%%)", info.duration_ms, info.noise_floor,
          info.peak_percent);
     send_voice("voice_cancel");
-    audio::play(audio::Sound::Cancel);
+    if (!follow_up_turn) audio::play(audio::Sound::Cancel);  // no reply: the conversation just ends, quietly
     voice_done();
   } else {
     LOGI(TAG, "sent %u ms of speech (peak %d%%, noise floor %d, %u ms dropped)", info.duration_ms, info.peak_percent,
@@ -722,12 +725,15 @@ void start_ringing(const String& id, uint32_t seconds) {
   LOGI(TAG, "ringing for %u s", seconds);
 }
 
-void start_listening_turn() {
-  audio::play(audio::Sound::Activate);
+// A new conversation (tap, wake word) plays the wake sound; listening for a reply after speaking plays a soft cue.
+void start_listening_turn(bool after_speech = false, bool follow_up = false) {
+  const audio::Sound cue = after_speech ? audio::Sound::Listen : audio::Sound::Activate;
+  audio::play(cue);
+  follow_up_turn = follow_up;
   ui::setState("listening");
   voice = Voice::Starting;
-  // start listening once the wake sound has played (a voiced one is longer than a chime), so it isn't sent
-  voice_at = millis() + max(CHIME_MS, audio::soundMs(audio::Sound::Activate) + 120);
+  // start listening once the cue has played (a voiced wake sound is longer than a chime), so it isn't sent
+  voice_at = millis() + max(CHIME_MS, audio::soundMs(cue) + 120);
 }
 
 void handle_tap() {
@@ -782,6 +788,7 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
   if (type == "speak_start") {  // a reply, or something Harkenn wants said (admin "Say it", an agent)
     if (ring_id.length()) stop_ringing();
     listen_after_speech = doc["listen"] | false;
+    follow_up_next = doc["follow_up"] | false;
     audio::startSpeech();
     speech_dropped = 0;
     voice = Voice::Speaking;
@@ -802,7 +809,7 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
   } else if (type == "voice_result") {
     const String heard = doc["heard"] | "";
     if (!heard.length() && voice == Voice::Waiting) {
-      audio::play(audio::Sound::Cancel);
+      if (!follow_up_turn) audio::play(audio::Sound::Cancel);
       voice_done();
     } else {
       LOGI(TAG, "heard \"%s\"", heard.c_str());
@@ -836,7 +843,7 @@ void update_voice() {
         voice_done();
         show_status_text("Mic is off", 2500);
       } else {
-        start_listening_turn();
+        start_listening_turn(true, follow_up_next);
       }
     } else {
       voice_done();
