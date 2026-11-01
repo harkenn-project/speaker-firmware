@@ -7,8 +7,9 @@ namespace audio {
 
 constexpr int SAMPLE_RATE = 16000;
 
-// Built-in sounds, synthesized on the speaker.
-enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring };
+// Sounds. Boot, Activate, Done, Error and Shutdown are the sound pack's slots (boot, wake, done, error, shutdown):
+// a clip from Harkenn if one is stored (an empty clip is silence), else synthesized on the speaker like the rest.
+enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring, Shutdown };
 
 bool begin();  // false if the codec doesn't answer
 
@@ -16,6 +17,15 @@ void setVolume(int percent);  // 0-100; 0 is silent
 int volume();
 
 void play(Sound sound);  // queued; volume ticks are dropped while something else is waiting
+bool playing();          // a sound is queued or playing (not speech)
+uint32_t soundMs(Sound sound);  // how long it plays
+
+// The sound pack's clips (16 kHz 16-bit mono PCM), kept in flash so they play at once, even at boot.
+// slot: boot, wake, done, error or shutdown.
+bool soundsBegin();  // mount the storage partition
+String soundSource(const char* slot);  // the URL the stored clip came from; "" if none
+bool storeSound(const char* slot, const String& url, const uint8_t* pcm, size_t bytes);  // bytes 0 = silence
+void removeSound(const char* slot);  // back to the built-in sound
 
 // Microphone. While muted, nothing is captured and listening stops.
 void setMicMuted(bool muted);

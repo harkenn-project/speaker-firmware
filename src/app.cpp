@@ -11,6 +11,7 @@
 #include <Update.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
+#include <esp_sleep.h>
 #include <mbedtls/sha256.h>
 #include <sys/time.h>
 
@@ -295,7 +296,7 @@ void connect_wifi() {
   int attempts = 0;
   while (wifi->run(10000) != WL_CONNECTED) {
     if (++attempts == 6) {
-      ui::showMessage("Can't join Wi-Fi", "Still trying. Hold the button 5 s for Wi-Fi setup.");
+      ui::showMessage("Can't join Wi-Fi", "Still trying. Hold the button 6 s for Wi-Fi setup.");
     }
     delay(500);
   }
@@ -425,6 +426,30 @@ uint32_t hex_color(JsonVariantConst v, uint32_t fallback) {
   return (s[0] == '#' && strlen(s) == 7) ? strtoul(s + 1, nullptr, 16) : fallback;
 }
 
+// The sound pack's clips: download the ones that changed into flash. null = the speaker's own sounds.
+constexpr const char* SOUND_SLOTS[] = {"boot", "wake", "done", "error", "shutdown"};
+
+bool apply_sounds(JsonVariantConst sounds) {
+  bool complete = true;
+  for (const char* slot : SOUND_SLOTS) {
+    JsonVariantConst s = sounds["slots"][slot];
+    if (sounds.isNull() || s.isNull()) {
+      if (audio::soundSource(slot).length()) audio::removeSound(slot);
+      continue;
+    }
+    const String url = s["url"] | "";
+    const String source = url.length() ? url : String("silent:") + (sounds["pack"] | "");
+    if (audio::soundSource(slot) == source) continue;
+    if (!url.length()) {
+      audio::storeSound(slot, source, nullptr, 0);
+      continue;
+    }
+    auto clip = download(url);
+    if (!clip || !audio::storeSound(slot, source, clip->data, clip->size)) complete = false;
+  }
+  return complete;
+}
+
 void apply_config(JsonDocument& doc) {
   JsonObject cfg = doc["config"];
   JsonObject display = cfg["display"];
@@ -454,10 +479,11 @@ void apply_config(JsonDocument& doc) {
     widgets.push_back(x);
   }
 
+  bool complete = apply_sounds(doc["sounds"]);
+
   // Character animations: download what changed, reuse the rest.
   ui::CharacterSet set;
   std::map<String, std::shared_ptr<ui::Blob>> next;
-  bool complete = true;
   if (character_size) {
     JsonObject states = doc["character"]["states"];
     for (size_t i = 0; i < ui::STATE_COUNT; i++) {
@@ -578,6 +604,32 @@ void set_volume_local(int v) {
 
 // Voice: a tap starts listening. What the mic hears streams to Harkenn, which answers with speech (docs/PROTOCOL.md).
 
+// Plays the shutdown sound and waits for it to finish (at most about 6 s).
+void say_goodbye() {
+  audio::play(audio::Sound::Shutdown);
+  delay(50);
+  const uint32_t start = millis();
+  while (audio::playing() && millis() - start < 6000) delay(20);
+  delay(250);  // let the last of it drain out of the DMA buffers
+}
+
+void restart() {
+  say_goodbye();
+  ESP.restart();
+}
+
+// Power off: deep sleep until the button is pressed, which starts the speaker up again.
+void power_off() {
+  LOGI(TAG, "powering off");
+  ui::showMessage("Goodbye!", "Press the button to turn on", false);
+  say_goodbye();
+  board::setBrightness(0);
+  while (board::buttonDown()) delay(20);  // released first, or the same press would wake it
+  delay(100);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_deep_sleep_start();
+}
+
 void flash_state(const char* state, uint32_t ms) {
   if (!play_state_until) play_state_restore = "idle";
   ui::setState(state);
@@ -674,7 +726,8 @@ void start_listening_turn() {
   audio::play(audio::Sound::Activate);
   ui::setState("listening");
   voice = Voice::Starting;
-  voice_at = millis() + CHIME_MS;
+  // start listening once the wake sound has played (a voiced one is longer than a chime), so it isn't sent
+  voice_at = millis() + max(CHIME_MS, audio::soundMs(audio::Sound::Activate) + 120);
 }
 
 void handle_tap() {
@@ -854,8 +907,7 @@ void handle_text(const uint8_t* payload, size_t len) {
     JsonObject args = doc["args"];
     LOGI(TAG, "command %s", command.c_str());
     if (command == "reboot") {
-      delay(300);
-      ESP.restart();
+      restart();
     } else if (command == "identify") {
       ui::identify();
     } else if (command == "refresh_config") {
@@ -935,8 +987,7 @@ void run_firmware_update() {
   }
   store::setUpdatedFrom(FW_VERSION);
   ui::showMessage("Update installed", "Restarting", true);
-  delay(800);
-  ESP.restart();
+  restart();
 }
 
 void update_sleep() {
@@ -1043,7 +1094,8 @@ void toggle_mic() {
   status_dirty = true;
 }
 
-// BOOT button: a short press mutes or unmutes the mic. Hold 5 s for Wi-Fi setup, 10 s for a factory reset.
+// BOOT button: a short press mutes or unmutes the mic. Hold 3 s to power off (a press turns it back on), 6 s for
+// Wi-Fi setup, 11 s for a factory reset.
 void button_task(void*) {
   uint32_t down_at = 0;
   int stage = 0;
@@ -1051,18 +1103,23 @@ void button_task(void*) {
     if (board::buttonDown()) {
       if (!down_at) down_at = millis();
       const uint32_t held = millis() - down_at;
-      if (held > 10000 && stage < 2) {
-        stage = 2;
+      if (held > 11000 && stage < 3) {
+        stage = 3;
         ui::showMessage("Release to factory reset", "Forgets Wi-Fi and adoption", false);
-      } else if (held > 5000 && stage < 1) {
-        stage = 1;
+      } else if (held > 6000 && stage < 2) {
+        stage = 2;
         ui::showMessage("Release for Wi-Fi setup", "Keep holding to factory reset", false);
+      } else if (held > 3000 && stage < 1) {
+        stage = 1;
+        ui::showMessage("Release to power off", "Keep holding for Wi-Fi setup", false);
       }
     } else if (down_at) {
       if (stage == 1) {
+        power_off();
+      } else if (stage == 2) {
         store::requestPortal();
         ESP.restart();
-      } else if (stage == 2) {
+      } else if (stage == 3) {
         store::factoryReset();
         ESP.restart();
       }
@@ -1089,6 +1146,7 @@ void main_task(void*) {
   if (updated_from.length()) LOGI(TAG, "firmware updated from %s to %s", updated_from.c_str(), FW_VERSION);
 
   volume = store::volume(70);
+  audio::soundsBegin();  // the sound pack's clips, before the boot sound plays
   if (audio::begin()) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());

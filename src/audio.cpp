@@ -1,5 +1,6 @@
 #include "audio.h"
 
+#include <LittleFS.h>
 #include <Wire.h>
 #include <driver/i2s_std.h>
 #include <freertos/stream_buffer.h>
@@ -121,6 +122,7 @@ constexpr Note ERROR_[] = {{220, 140, 50}, {0, 60, 0}, {208, 260, 50}, {0, 0, 0}
 constexpr Note MUTE_ON[] = {{659, 90, 45}, {440, 220, 45}, {0, 0, 0}};
 constexpr Note MUTE_OFF[] = {{440, 90, 45}, {659, 220, 45}, {0, 0, 0}};
 constexpr Note TICK[] = {{1500, 22, 25}, {0, 0, 0}};
+constexpr Note SHUTDOWN[] = {{1047, 90, 45}, {784, 90, 45}, {659, 90, 45}, {523, 320, 45}, {0, 0, 0}};
 // A phone-like trill, played every RING_EVERY_MS while a speaker rings (app.cpp).
 constexpr Note RING[] = {{1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55},
                          {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {0, 180, 0}, {1047, 55, 55},
@@ -138,6 +140,7 @@ const Note* notes_for(Sound s) {
     case Sound::MuteOff: return MUTE_OFF;
     case Sound::Tick: return TICK;
     case Sound::Ring: return RING;
+    case Sound::Shutdown: return SHUTDOWN;
   }
   return TICK;
 }
@@ -184,14 +187,46 @@ void amp(bool on) {
   if (on) delay(5);
 }
 
+// The sound pack's clips, in flash: /<slot>.pcm, and /<slot>.url with where it came from.
+bool fs_ok = false;
+volatile bool sound_playing = false;
+
+const char* slot_for(Sound s) {
+  switch (s) {
+    case Sound::Boot: return "boot";
+    case Sound::Activate: return "wake";
+    case Sound::Done: return "done";
+    case Sound::Error: return "error";
+    case Sound::Shutdown: return "shutdown";
+    default: return nullptr;
+  }
+}
+
+String clip_path(const char* slot) { return String("/") + slot + ".pcm"; }
+
+// Plays the slot's clip if there is one (true), including a silent one.
+bool play_clip(Sound s) {
+  const char* slot = slot_for(s);
+  if (!fs_ok || !slot) return false;
+  File f = LittleFS.open(clip_path(slot), "r");
+  if (!f) return false;
+  static int16_t buf[CHUNK];
+  size_t n;
+  while ((n = f.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf))) > 0) write_samples(buf, n / sizeof(int16_t));
+  f.close();
+  return true;
+}
+
 void play_task(void*) {
   static int16_t buf[CHUNK];
   for (;;) {
     Sound s;
     if (xQueueReceive(queue, &s, speech_on ? 0 : pdMS_TO_TICKS(AMP_OFF_AFTER_MS)) == pdTRUE) {
       if (current_volume <= 0) continue;
+      sound_playing = true;
       amp(true);
-      render(notes_for(s));
+      if (!play_clip(s)) render(notes_for(s));
+      sound_playing = false;
       continue;
     }
     if (speech_on) {
@@ -323,6 +358,64 @@ void play(Sound sound) {
   if (!ok) return;
   if (sound == Sound::Tick && uxQueueMessagesWaiting(queue)) return;
   xQueueSend(queue, &sound, 0);
+}
+
+bool playing() { return ok && (sound_playing || uxQueueMessagesWaiting(queue)); }
+
+uint32_t soundMs(Sound sound) {
+  const char* slot = slot_for(sound);
+  if (fs_ok && slot && LittleFS.exists(clip_path(slot))) {
+    File f = LittleFS.open(clip_path(slot), "r");
+    const uint32_t ms = f ? f.size() * 1000 / (SAMPLE_RATE * 2) : 0;
+    f.close();
+    return ms;
+  }
+  uint32_t ms = 0;
+  for (const Note* n = notes_for(sound); n->ms; n++) ms += n->ms;
+  return ms;
+}
+
+bool soundsBegin() {
+  fs_ok = LittleFS.begin(true, "/sounds", 4, "storage");
+  if (!fs_ok) LOGE(TAG, "couldn't mount the storage partition: built-in sounds only");
+  return fs_ok;
+}
+
+String soundSource(const char* slot) {
+  if (!fs_ok) return "";
+  File f = LittleFS.open(String("/") + slot + ".url", "r");
+  if (!f) return "";
+  String url = f.readString();
+  f.close();
+  return url;
+}
+
+bool storeSound(const char* slot, const String& url, const uint8_t* pcm, size_t bytes) {
+  if (!fs_ok) return false;
+  const String tmp = String("/") + slot + ".tmp";
+  File f = LittleFS.open(tmp, "w");
+  if (!f) return false;
+  const bool written = f.write(pcm, bytes) == bytes;
+  f.close();
+  if (!written) {
+    LittleFS.remove(tmp);
+    LOGW(TAG, "out of flash for the %s sound", slot);
+    return false;
+  }
+  LittleFS.remove(clip_path(slot));
+  LittleFS.rename(tmp, clip_path(slot));  // never a half-written clip
+  File u = LittleFS.open(String("/") + slot + ".url", "w");
+  if (u) {
+    u.print(url);
+    u.close();
+  }
+  return true;
+}
+
+void removeSound(const char* slot) {
+  if (!fs_ok) return;
+  LittleFS.remove(clip_path(slot));
+  LittleFS.remove(String("/") + slot + ".url");
 }
 
 void setMicMuted(bool muted) {
