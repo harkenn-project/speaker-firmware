@@ -57,6 +57,24 @@ you upload (Harkenn reads it from the image).
 python tools/publish_release.py --push
 ```
 
+**Channels.** Besides stable, there are three pre-release channels. Each has its own manifest on the `releases` branch,
+and its versions carry a matching suffix:
+
+| Channel | Manifest | Example version | For |
+|---|---|---|---|
+| stable | `latest.json` | `0.12.0` | everyone |
+| beta | `latest-beta.json` | `0.12.0-beta.1` | nearly ready, for people happy to report problems |
+| alpha | `latest-alpha.json` | `0.12.0-alpha.3` | new features as they come together |
+| development | `latest-development.json` | `0.12.0-development.7` | every build, for testing |
+
+```
+python tools/publish_release.py --channel=beta --push
+```
+
+A Harkenn server follows one channel (its **Firmware** page) and offers the newest firmware on that channel or any
+more stable one, so beta speakers move on to the next stable release. Versions compare as semantic versions:
+`0.12.0-beta.10` > `0.12.0-beta.2`, and `0.12.0` > every `0.12.0-…`.
+
 Each speaker asks Harkenn for updates once when it starts; if `latest.json` names a newer version it shows
 *Update available* with *Install* and *Dismiss* (a dismissed version isn't offered again; a newer one is).
 

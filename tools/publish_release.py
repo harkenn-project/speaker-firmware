@@ -1,11 +1,15 @@
 """Publish a firmware release on this repository's `releases` branch.
 
-    python tools/publish_release.py [firmware.bin] [--push] [--trailer=TEXT]
+    python tools/publish_release.py [firmware.bin] [--channel=stable|beta|alpha|development] [--push] [--trailer=TEXT]
 
 Copies the built image (default .pio/build/harkenn-speaker/firmware.bin) to v<version>/firmware.bin on the
-`releases` branch, points latest.json at it and commits; --push also pushes the branch. The version and board are
-read from the image's HARKENN-FW marker (src/main.cpp), so bump FW_VERSION in platformio.ini first. A Harkenn
-server reads latest.json from this branch and offers newer firmware to speakers when they start.
+`releases` branch, points the channel's manifest at it and commits; --push also pushes the branch. The version and
+board are read from the image's HARKENN-FW marker (src/main.cpp), so bump FW_VERSION in platformio.ini first.
+
+Channels and their manifests: stable latest.json, beta latest-beta.json, alpha latest-alpha.json, development
+latest-development.json. Give pre-releases a semantic-version suffix that matches, e.g. 0.12.0-beta.1,
+0.12.0-alpha.3, 0.12.0-development.7; stable versions have none. A Harkenn server follows one channel and offers the
+newest firmware on it or on any more stable channel (app/updates.py in server-docker).
 
 The branch is checked out in a git worktree at .releases/ (ignored), so the source checkout is never touched.
 """
@@ -22,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMAGE = ROOT / ".pio/build/harkenn-speaker/firmware.bin"
 WORKTREE = ROOT / ".releases"
 BRANCH = "releases"
+CHANNELS = ("stable", "beta", "alpha", "development")
 MARKER = re.compile(rb"HARKENN-FW\|([0-9A-Za-z.+_-]{1,32})\|([0-9A-Za-z._-]{1,64})\|")
 
 
@@ -29,8 +34,19 @@ def git(*args: str, cwd: Path = ROOT, check: bool = True) -> subprocess.Complete
     return subprocess.run(["git", *args], cwd=cwd, check=check, capture_output=True, text=True)
 
 
-def version_key(v: str) -> tuple[int, ...]:
-    return tuple(int(p) for p in re.findall(r"\d+", re.split(r"[-+]", v, maxsplit=1)[0])[:3])
+def version_key(version: str) -> tuple:
+    """Semantic-version order, as the server compares: 0.6.0-beta.2 < 0.6.0-beta.10 < 0.6.0."""
+    v = version.strip().lstrip("vV").split("+", 1)[0]
+    core, _, pre = v.partition("-")
+    nums = [int(p) for p in re.findall(r"\d+", core)[:3]]
+    nums += [0] * (3 - len(nums))
+    if not pre:
+        return (*nums, 1, ())
+    return (*nums, 0, tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")))
+
+
+def manifest_name(channel: str) -> str:
+    return "latest.json" if channel == "stable" else f"latest-{channel}.json"
 
 
 def inspect(data: bytes) -> tuple[str, str]:
@@ -62,25 +78,33 @@ def worktree() -> Path:
 
 def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    channel = next((a[10:] for a in sys.argv[1:] if a.startswith("--channel=")), "stable")
+    if channel not in CHANNELS:
+        sys.exit(f"--channel must be one of {', '.join(CHANNELS)}")
     image = Path(args[0]) if args else DEFAULT_IMAGE
     data = image.read_bytes()
     version, hardware = inspect(data)
+    pre = version.partition("-")[2]
+    if channel == "stable" and pre:
+        sys.exit(f"{version} is a pre-release: publish it on --channel=beta, alpha or development")
+    if channel != "stable" and not pre.startswith(channel):
+        sys.exit(f"for the {channel} channel, give FW_VERSION a -{channel}.N suffix (e.g. 0.12.0-{channel}.1)")
     wt = worktree()
-    manifest_path = wt / "latest.json"
+    manifest_path = wt / manifest_name(channel)
     if manifest_path.exists():
         current = json.loads(manifest_path.read_text())["version"]
         if version_key(version) <= version_key(current):
-            sys.exit(f"{image} is {version}, not newer than the published {current}: bump FW_VERSION first")
+            sys.exit(f"{image} is {version}, not newer than {current} on {channel}: bump FW_VERSION first")
     target = wt / f"v{version}" / "firmware.bin"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     manifest = {"version": version, "hardware": hardware, "file": f"v{version}/firmware.bin", "size": len(data),
                 "sha256": hashlib.sha256(data).hexdigest()}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    git("add", "latest.json", str(target.relative_to(wt)), cwd=wt)
+    git("add", manifest_path.name, str(target.relative_to(wt)), cwd=wt)
     trailers = [f"--trailer={a[10:]}" for a in sys.argv[1:] if a.startswith("--trailer=")]
-    git("commit", "-q", "-m", f"Firmware {version}", *trailers, cwd=wt)
-    print(f"committed firmware {version} ({len(data)} bytes, {hardware}) on {BRANCH}")
+    git("commit", "-q", "-m", f"Firmware {version} ({channel})", *trailers, cwd=wt)
+    print(f"committed firmware {version} ({len(data)} bytes, {hardware}) on {BRANCH}, channel {channel}")
     if "--push" in sys.argv:
         git("push", "-q", "origin", BRANCH, cwd=wt)
         print("pushed")
