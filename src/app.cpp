@@ -135,6 +135,19 @@ String ring_id;                    // ringing for an agent (ring): tap to answer
 uint32_t ring_until = 0, ring_next = 0;
 size_t speech_dropped = 0;
 
+// The assistant's screen (screen): downloaded and shown from the main loop, taps reported back (screen_tap).
+struct PendingScreen {
+  String id, url;
+  std::vector<ui::TapRegion> regions;
+  bool tap_dismisses = true;
+  uint32_t seconds = 60;
+};
+std::unique_ptr<PendingScreen> pending_screen;
+String screen_id;
+uint32_t screen_until = 0;
+volatile bool screen_tapped = false;
+char screen_tap_label[64];  // "" = dismissed
+
 String ap_name() {
   String suffix = device_id.substring(8);
   suffix.toUpperCase();
@@ -851,8 +864,12 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
     audio::stopListening();  // pump_mic() ends the utterance
   } else if (type == "voice_result") {
     const String heard = doc["heard"] | "";
+    const String reply = doc["reply"] | "";
     if (!heard.length() && voice == Voice::Waiting) {
       if (!follow_up_turn) audio::play(audio::Sound::Cancel);
+      voice_done();
+    } else if (!reply.length() && voice == Voice::Waiting) {  // nothing to say: only a screen
+      LOGI(TAG, "heard \"%s\"", heard.c_str());
       voice_done();
     } else {
       LOGI(TAG, "heard \"%s\"", heard.c_str());
@@ -861,6 +878,68 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
     voice_failed((doc["message"] | "Harkenn couldn't answer"));
   }
 }
+// A labelled part of the assistant's screen was tapped: it's the person's next turn, instead of whatever was going on.
+void tap_screen(const String& label) {
+  if (voice == Voice::Listening) {
+    audio::stopListening();
+    send_voice("voice_cancel");
+  } else if (voice == Voice::Starting) {
+    audio::stopListening();
+  } else if (voice == Voice::Waiting) {
+    send_voice("voice_cancel");
+  } else if (voice == Voice::Speaking) {
+    audio::stopSpeech();
+    send_voice("speak_stop");
+  }
+  listen_after_speech = false;
+  voice_session++;
+  JsonDocument doc;
+  doc["type"] = "screen_tap";
+  doc["session"] = String(voice_session);
+  doc["screen"] = screen_id;
+  doc["label"] = label;
+  send_json(doc);
+  LOGI(TAG, "screen: tapped \"%s\"", label.c_str());
+  audio::play(audio::Sound::Done);
+  ui::setState("thinking");
+  voice = Voice::Waiting;
+  voice_at = millis() + REPLY_TIMEOUT_MS;
+}
+
+void update_screen() {
+  if (pending_screen) {
+    auto sc = std::move(pending_screen);
+    auto image = download(sc->url);
+    if (!image) {
+      LOGW(TAG, "screen: couldn't download it");
+    } else {
+      ui::showScreen(image, sc->regions, sc->tap_dismisses);
+      screen_id = sc->id;
+      screen_until = millis() + sc->seconds * 1000;
+      board::markActivity();  // wake the display
+      LOGI(TAG, "screen: shown for %u s, %u tappable", sc->seconds, static_cast<unsigned>(sc->regions.size()));
+    }
+  }
+  if (screen_tapped) {
+    screen_tapped = false;
+    const String label = screen_tap_label;
+    ui::hideScreen();
+    if (ring_id.length()) {
+      handle_tap();  // ringing: any tap answers
+    } else if (label.length()) {
+      tap_screen(label);
+    } else {
+      JsonDocument doc;
+      doc["type"] = "screen_dismiss";
+      doc["screen"] = screen_id;
+      send_json(doc);
+    }
+  }
+  if (!ui::screenShown()) return;
+  if (static_cast<int32_t>(millis() - screen_until) >= 0) ui::hideScreen();
+  else board::markActivity();  // the display stays on while it's shown
+}
+
 void update_voice() {
   if (tap_requested) {
     tap_requested = false;
@@ -952,6 +1031,25 @@ void handle_text(const uint8_t* payload, size_t len) {
   } else if (type.startsWith("speak_") || type.startsWith("voice_") || type.startsWith("ring") ||
              type == "listen_stop") {
     handle_voice_message(type, doc);
+  } else if (type == "screen") {
+    auto sc = std::unique_ptr<PendingScreen>(new PendingScreen());
+    sc->id = doc["screen"] | "";
+    sc->url = doc["url"] | "";
+    sc->tap_dismisses = String(doc["dismiss"] | "tap") != "none";
+    sc->seconds = constrain(doc["seconds"] | 60, 5, 600);
+    for (JsonObject r : doc["regions"].as<JsonArray>()) {
+      ui::TapRegion t;
+      t.label = r["label"] | "";
+      t.x = r["x"] | 0;
+      t.y = r["y"] | 0;
+      t.w = r["w"] | 0;
+      t.h = r["h"] | 0;
+      if (t.label.length() && t.w > 0 && t.h > 0) sc->regions.push_back(t);
+    }
+    if (sc->url.length()) pending_screen = std::move(sc);  // downloaded from the main loop
+  } else if (type == "screen_clear") {
+    pending_screen.reset();
+    ui::hideScreen();
   } else if (type == "update_available") {
     JsonObject f = doc["firmware"];
     auto fw = std::unique_ptr<FirmwareUpdate>(new FirmwareUpdate());
@@ -1118,6 +1216,7 @@ bool run_online() {
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
+    update_screen();
     update_sleep();
     if (offer_install && offered_update) {
       LOGI(TAG, "installing firmware %s from the screen", offered_update->version.c_str());
@@ -1219,6 +1318,10 @@ void main_task(void*) {
     audio::setMicMuted(store::micMuted());
   }
   ui::setMuted(audio::micMuted());
+  ui::onScreenTap([](const char* label) {
+    strlcpy(screen_tap_label, label, sizeof(screen_tap_label));
+    screen_tapped = true;
+  });
   ui::onTouch([] { tap_requested = true; },
               [](int delta) {
                 const int before = volume;

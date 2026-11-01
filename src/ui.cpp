@@ -56,6 +56,18 @@ struct Gesture {
   uint32_t t0 = 0;
 } gesture;
 
+// The assistant's screen: a picture over the home screen with tappable areas (showScreen).
+lv_obj_t* screen_layer = nullptr;
+lv_obj_t* screen_press = nullptr;  // highlights the area being pressed
+std::vector<TapRegion> screen_regions;
+bool screen_tap_dismisses = true;
+void (*screen_tap_cb)(const char* label) = nullptr;
+struct ScreenGesture {
+  int region = -1;  // the area pressed, -1 = none
+  bool cancelled = false;
+  lv_point_t start{};
+} screen_gesture;
+
 lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
 
 // KANI animation player (format: app/kani.py in server-docker). Frames are decoded into one RGB565 frame buffer in PSRAM
@@ -65,13 +77,16 @@ uint16_t rd16(const uint8_t* p) { return p[0] | p[1] << 8; }
 uint32_t rd32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | static_cast<uint32_t>(p[3]) << 24; }
 
 struct Player {
+  lv_obj_t* img = nullptr;  // the widget it plays in
   std::shared_ptr<Blob> blob;
   uint16_t w = 0, h = 0, frames = 0, index = 0;
   uint16_t* fb = nullptr;
   size_t fb_pixels = 0;
   lv_image_dsc_t dsc{};
   lv_timer_t* timer = nullptr;
-} player;
+};
+Player player;         // the character
+Player screen_player;  // the assistant's screen
 
 bool kani_valid(const Blob& b, uint16_t& w, uint16_t& h, uint16_t& n) {
   if (b.size < 12 || memcmp(b.data, "KANI", 4) != 0 || b.data[4] != 1) return false;
@@ -123,61 +138,64 @@ bool kani_decode(const Blob& b, uint16_t i, uint16_t* fb, size_t total) {
   return px == total;
 }
 
-void player_stop() {
-  if (player.timer) lv_timer_delete(player.timer);
-  player.timer = nullptr;
-  player.blob.reset();
+void player_stop(Player& p) {
+  if (p.timer) lv_timer_delete(p.timer);
+  p.timer = nullptr;
+  p.blob.reset();
+  p.img = nullptr;
 }
 
 void player_tick(lv_timer_t* t) {
-  if (!player.blob || !anim_img) return;
-  player.index = (player.index + 1) % player.frames;
-  if (!kani_decode(*player.blob, player.index, player.fb, player.fb_pixels)) {
-    player_stop();
+  Player& p = *static_cast<Player*>(lv_timer_get_user_data(t));
+  if (!p.blob || !p.img) return;
+  p.index = (p.index + 1) % p.frames;
+  if (!kani_decode(*p.blob, p.index, p.fb, p.fb_pixels)) {
+    player_stop(p);
     return;
   }
-  lv_image_cache_drop(&player.dsc);
-  lv_obj_invalidate(anim_img);
-  lv_timer_set_period(t, kani_frame_ms(*player.blob, player.index));
+  lv_image_cache_drop(&p.dsc);
+  lv_obj_invalidate(p.img);
+  lv_timer_set_period(t, kani_frame_ms(*p.blob, p.index));
 }
 
-void player_play(const std::shared_ptr<Blob>& blob) {
-  if (!anim_img || blob == player.blob) return;
-  player_stop();
+void player_play(Player& p, lv_obj_t* img, const std::shared_ptr<Blob>& blob) {
+  if (!img || (img == p.img && blob == p.blob)) return;
+  player_stop(p);
   uint16_t w, h, n;
   if (!blob || !kani_valid(*blob, w, h, n)) {
-    lv_obj_add_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
     return;
   }
   const size_t pixels = static_cast<size_t>(w) * h;
-  if (pixels != player.fb_pixels) {
-    heap_caps_free(player.fb);
-    player.fb = static_cast<uint16_t*>(heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM));
-    player.fb_pixels = player.fb ? pixels : 0;
-    if (!player.fb) return;
+  if (pixels != p.fb_pixels) {
+    heap_caps_free(p.fb);
+    p.fb = static_cast<uint16_t*>(heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM));
+    p.fb_pixels = p.fb ? pixels : 0;
+    if (!p.fb) return;
   }
-  if (!kani_decode(*blob, 0, player.fb, pixels)) {
-    lv_obj_add_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
+  if (!kani_decode(*blob, 0, p.fb, pixels)) {
+    lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
     return;
   }
-  player.blob = blob;
-  player.w = w;
-  player.h = h;
-  player.frames = n;
-  player.index = 0;
-  player.dsc = {};
-  player.dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-  player.dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-  player.dsc.header.w = w;
-  player.dsc.header.h = h;
-  player.dsc.header.stride = w * 2;
-  player.dsc.data = reinterpret_cast<const uint8_t*>(player.fb);
-  player.dsc.data_size = pixels * 2;
-  lv_image_cache_drop(&player.dsc);
-  lv_image_set_src(anim_img, &player.dsc);
-  lv_obj_remove_flag(anim_img, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_invalidate(anim_img);
-  if (n > 1) player.timer = lv_timer_create(player_tick, kani_frame_ms(*blob, 0), nullptr);
+  p.img = img;
+  p.blob = blob;
+  p.w = w;
+  p.h = h;
+  p.frames = n;
+  p.index = 0;
+  p.dsc = {};
+  p.dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+  p.dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+  p.dsc.header.w = w;
+  p.dsc.header.h = h;
+  p.dsc.header.stride = w * 2;
+  p.dsc.data = reinterpret_cast<const uint8_t*>(p.fb);
+  p.dsc.data_size = pixels * 2;
+  lv_image_cache_drop(&p.dsc);
+  lv_image_set_src(img, &p.dsc);
+  lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(img);
+  if (n > 1) p.timer = lv_timer_create(player_tick, kani_frame_ms(*blob, 0), &p);
 }
 
 const lv_font_t* font(const String& size) {
@@ -190,11 +208,14 @@ const lv_font_t* font(const String& size) {
 // Removes everything from the screen and paints the theme background.
 lv_obj_t* reset_screen() {
   lv_obj_t* scr = lv_screen_active();
-  player_stop();
+  player_stop(player);
+  player_stop(screen_player);
   lv_obj_clean(scr);
   ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
   touch_layer = volume_arc = volume_label = nullptr;
   progress_bar = progress_detail = offer_panel = nullptr;
+  screen_layer = screen_press = nullptr;
+  screen_regions.clear();
   progress_title = "";
   if (flash_timer) {
     lv_timer_delete(flash_timer);
@@ -281,7 +302,7 @@ void apply_state() {
   if (anim_img) {
     int i = stateIndex(state.c_str());
     if (i < 0 || !character[i]) i = 0;
-    player_play(character[i]);
+    player_play(player, anim_img, character[i]);
   }
 }
 
@@ -417,6 +438,44 @@ void create_touch_layer(lv_obj_t* scr) {
         }
       },
       LV_EVENT_ALL, nullptr);
+}
+
+int region_at(const lv_point_t& p) {
+  for (int i = static_cast<int>(screen_regions.size()) - 1; i >= 0; i--) {  // the last drawn is on top
+    const TapRegion& r = screen_regions[i];
+    if (p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h) return i;
+  }
+  return -1;
+}
+
+void screen_event(lv_event_t* e) {
+  const lv_event_code_t code = lv_event_get_code(e);
+  lv_indev_t* indev = lv_indev_active();
+  if (!indev) return;
+  lv_point_t p;
+  lv_indev_get_point(indev, &p);
+  ScreenGesture& g = screen_gesture;
+  if (code == LV_EVENT_PRESSED) {
+    g = ScreenGesture{};
+    g.start = p;
+    g.region = region_at(p);
+    if (g.region >= 0 && screen_press) {
+      const TapRegion& r = screen_regions[g.region];
+      lv_obj_set_pos(screen_press, r.x, r.y);
+      lv_obj_set_size(screen_press, r.w, r.h);
+      lv_obj_remove_flag(screen_press, LV_OBJ_FLAG_HIDDEN);
+    }
+  } else if (code == LV_EVENT_PRESSING) {
+    if (!g.cancelled && abs(p.x - g.start.x) + abs(p.y - g.start.y) > 24) {
+      g.cancelled = true;  // a swipe, not a tap
+      if (screen_press) lv_obj_add_flag(screen_press, LV_OBJ_FLAG_HIDDEN);
+    }
+  } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    if (screen_press) lv_obj_add_flag(screen_press, LV_OBJ_FLAG_HIDDEN);
+    if (code == LV_EVENT_PRESS_LOST || g.cancelled || !screen_tap_cb) return;
+    if (g.region >= 0) screen_tap_cb(screen_regions[g.region].label.c_str());
+    else if (screen_tap_dismisses) screen_tap_cb("");
+  }
 }
 
 }  // namespace
@@ -619,6 +678,64 @@ void identify() {
         else lv_obj_remove_flag(flash, LV_OBJ_FLAG_HIDDEN);
       },
       250, new uint32_t(0));
+}
+
+}  // namespace ui
+
+namespace ui {
+
+void showScreen(const std::shared_ptr<Blob>& image, const std::vector<TapRegion>& regions, bool tap_dismisses) {
+  Lock l;
+  if (!touch_layer) return;  // only over the home screen
+  if (screen_layer) {
+    player_stop(screen_player);
+    lv_obj_delete(screen_layer);
+  }
+  screen_regions = regions;
+  screen_tap_dismisses = tap_dismisses;
+  lv_obj_t* scr = lv_screen_active();
+  screen_layer = lv_obj_create(scr);
+  lv_obj_remove_style_all(screen_layer);
+  lv_obj_set_size(screen_layer, board::SCREEN_SIZE, board::SCREEN_SIZE);
+  lv_obj_set_pos(screen_layer, 0, 0);
+  lv_obj_set_style_bg_color(screen_layer, color(theme.background), 0);
+  lv_obj_set_style_bg_opa(screen_layer, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(screen_layer, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(screen_layer, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(screen_layer, screen_event, LV_EVENT_ALL, nullptr);
+  lv_obj_t* img = lv_image_create(screen_layer);
+  lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_pos(img, 0, 0);
+  lv_obj_set_size(img, board::SCREEN_SIZE, board::SCREEN_SIZE);
+  player_play(screen_player, img, image);
+  screen_press = lv_obj_create(screen_layer);
+  lv_obj_remove_style_all(screen_press);
+  lv_obj_remove_flag(screen_press, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(screen_press, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(screen_press, LV_OPA_30, 0);
+  lv_obj_set_style_radius(screen_press, 12, 0);
+  lv_obj_add_flag(screen_press, LV_OBJ_FLAG_HIDDEN);
+  if (ring) lv_obj_move_foreground(ring);  // the state ring stays visible (it doesn't take touches)
+  if (offer_panel) lv_obj_move_foreground(offer_panel);
+}
+
+void hideScreen() {
+  Lock l;
+  if (!screen_layer) return;
+  player_stop(screen_player);
+  lv_obj_delete(screen_layer);
+  screen_layer = screen_press = nullptr;
+  screen_regions.clear();
+}
+
+bool screenShown() {
+  Lock l;
+  return screen_layer != nullptr;
+}
+
+void onScreenTap(void (*on_tap)(const char* label)) {
+  Lock l;
+  screen_tap_cb = on_tap;
 }
 
 }  // namespace ui

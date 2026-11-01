@@ -58,6 +58,18 @@ void setMuted(bool muted);
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)());
 void hideUpdateOffer();
 
+// The assistant's screen, over the home screen: a picture (KANI, may be animated) with tappable areas. A tap on an
+// area calls on_tap(label); a tap anywhere else calls on_tap("") when tap_dismisses (the app hides it). Gone with
+// hideScreen() or a new layout. on_tap runs on the UI task with the UI locked: keep it short.
+struct TapRegion {
+  String label;
+  int x = 0, y = 0, w = 0, h = 0;
+};
+void showScreen(const std::shared_ptr<Blob>& image, const std::vector<TapRegion>& regions, bool tap_dismisses);
+void hideScreen();
+bool screenShown();
+void onScreenTap(void (*on_tap)(const char* label));
+
 // Touch on the home screen. A tap in the middle calls `on_tap`; dragging around the edge turns the volume up
 // (clockwise) or down, calling `on_volume` with the change in percent, which returns the new volume to display.
 // Both run on the UI task with the UI locked: keep them short.
