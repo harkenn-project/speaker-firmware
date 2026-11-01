@@ -1,7 +1,7 @@
 {
-  "version": "0.12.0-development.5",
+  "version": "0.12.0-development.6",
   "hardware": "sp-esp32-s3-1.28-box",
-  "file": "v0.12.0-development.5/firmware.bin",
-  "size": 2142288,
-  "sha256": "939cad8af3039cee9044efcaf66974d6a4bf6a891f6df8fe6d63413659c89b17"
+  "file": "v0.12.0-development.6/firmware.bin",
+  "size": 2142704,
+  "sha256": "a2c292f155b3f28ac4af893266fe88cf44d314b34be19553450388c4688526ed"
 }
