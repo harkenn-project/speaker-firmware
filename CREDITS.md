@@ -13,6 +13,11 @@ The Harkenn speaker firmware is built on these projects. Thank you to all of the
 | [LovyanGFX](https://github.com/lovyan03/LovyanGFX) | Display (GC9A01) and touch (CST816) drivers | MIT and BSD-2-Clause |
 | [arduinoWebSockets](https://github.com/Links2004/arduinoWebSockets) (Links2004) | WebSocket connection to the server | LGPL-2.1 |
 | [ArduinoJson](https://github.com/bblanchon/ArduinoJson) (Benoît Blanchon) | JSON | MIT |
+| [TensorFlow Lite Micro](https://github.com/tensorflow/tflite-micro), as Espressif's [esp-tflite-micro](https://github.com/espressif/esp-tflite-micro) (in `lib/tflm`) | Runs the wake word model | Apache-2.0 |
+| TensorFlow's micro audio frontend ([tensorflow/lite/experimental/microfrontend](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/experimental/microfrontend)) | Wake word audio features | Apache-2.0 |
+| [kissfft](https://github.com/mborgerding/kissfft) (Mark Borgerding), bundled with esp-tflite-micro | FFT for those features | BSD-3-Clause |
+| [esp-nn](https://github.com/espressif/esp-nn) (Espressif, in `lib/esp-nn`) | ESP32-S3 vector kernels for the model | Apache-2.0 |
+| [FlatBuffers](https://github.com/google/flatbuffers), [gemmlowp](https://github.com/google/gemmlowp), [ruy](https://github.com/google/ruy) (Google), bundled with esp-tflite-micro | Model format and maths helpers for TFLM | Apache-2.0 |
 | [ISRG Root X1 and X2](https://letsencrypt.org/certificates/) (Let's Encrypt) | Root certificates in `src/ca_certs.h`, for servers on https | public |
 
 The firmware's full source is in this repository, so the LGPL libraries can be rebuilt and relinked from it.

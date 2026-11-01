@@ -1,0 +1,1 @@
+Assembled by tools/vendor_tflm.py from esp-tflite-micro v1.4.1 (https://github.com/espressif/esp-tflite-micro.git) and TensorFlow v2.18.0's tensorflow/lite/experimental/microfrontend/lib (Apache-2.0, see LICENSE); kissfft is BSD-3-Clause (third_party/kissfft/COPYING). Don't edit by hand: change the pins and run it again.

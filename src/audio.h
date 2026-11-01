@@ -27,6 +27,7 @@ bool soundsBegin();  // mount the storage partition
 String soundSource(const char* slot);  // the URL the stored clip came from; "" if none
 bool storeSound(const char* slot, const String& url, const uint8_t* pcm, size_t bytes);  // bytes 0 = silence
 void removeSound(const char* slot);  // back to the built-in sound
+uint8_t* readSound(const char* slot, size_t* size);  // a stored file, in PSRAM (free with free()); null if none
 
 // Microphone. While muted, nothing is captured and listening stops.
 void setMicMuted(bool muted);

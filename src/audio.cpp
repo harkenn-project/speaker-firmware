@@ -8,6 +8,7 @@
 
 #include "board.h"
 #include "logbuf.h"
+#include "wakeword.h"
 
 namespace audio {
 namespace {
@@ -285,6 +286,7 @@ void capture_task(void*) {
     if (i2s_channel_read(rx, buf, sizeof(buf), &got, pdMS_TO_TICKS(200)) != ESP_OK || !got) continue;
     const size_t n = got / sizeof(int16_t);
     const bool speech = !mic_muted && is_speech(buf, n);
+    if (!listen_on && !mic_muted) wakeword::feed(buf, n);  // between sessions, the wake word listens
     xSemaphoreTake(rec_mutex, portMAX_DELAY);
     if (listen_on) {
       Listen& l = listen_state;
@@ -412,6 +414,17 @@ bool storeSound(const char* slot, const String& url, const uint8_t* pcm, size_t 
     u.close();
   }
   return true;
+}
+
+uint8_t* readSound(const char* slot, size_t* size) {
+  *size = 0;
+  if (!fs_ok) return nullptr;
+  File f = LittleFS.open(clip_path(slot), "r");
+  if (!f) return nullptr;
+  auto* data = static_cast<uint8_t*>(heap_caps_malloc(f.size() ? f.size() : 1, MALLOC_CAP_SPIRAM));
+  if (data) *size = f.read(data, f.size());
+  f.close();
+  return data;
 }
 
 void removeSound(const char* slot) {

@@ -1,0 +1,29 @@
+{
+  "name": "esp-nn",
+  "version": "1.4.1",
+  "description": "Espressif's optimized neural network kernels (ESP32-S3 vector instructions)",
+  "license": "Apache-2.0",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "srcDir": ".",
+    "includeDir": "include",
+    "flags": [
+      "-O2",
+      "-mlongcalls",
+      "-fno-unroll-loops",
+      "-Wno-unused-function",
+      "-Isrc/common"
+    ],
+    "srcFilter": [
+      "-<*>",
+      "+<src/**/*_ansi.c>",
+      "+<src/**/*_opt.c>",
+      "+<src/common/esp_nn_multicore.c>",
+      "+<src/convolution/esp_nn_conv_mt_split.c>",
+      "+<src/basic_math/esp_nn_mul_mt.c>",
+      "+<src/**/*_esp32s3.c>",
+      "+<src/**/*_esp32s3.S>"
+    ]
+  }
+}

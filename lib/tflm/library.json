@@ -1,0 +1,69 @@
+{
+  "name": "tflm",
+  "version": "1.4.1",
+  "description": "TensorFlow Lite Micro (esp-tflite-micro) and its micro audio frontend, for the wake word",
+  "license": "Apache-2.0",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    {
+      "name": "esp-nn"
+    }
+  ],
+  "build": {
+    "srcDir": ".",
+    "includeDir": ".",
+    "libArchive": true,
+    "flags": [
+      "-O3",
+      "-DESP_NN",
+      "-fno-rtti",
+      "-fno-threadsafe-statics",
+      "-fno-exceptions",
+      "-Wno-unused-parameter",
+      "-Wno-maybe-uninitialized",
+      "-Wno-missing-field-initializers",
+      "-Wno-sign-compare",
+      "-Wno-type-limits",
+      "-Wno-nonnull",
+      "-Wno-double-promotion",
+      "-Wno-shadow",
+      "-Wno-return-type",
+      "-Wno-strict-aliasing"
+    ],
+    "srcFilter": [
+      "-<*>",
+      "+<tensorflow/lite/micro/*.cc>",
+      "-<tensorflow/lite/micro/micro_time.cc>",
+      "+<tensorflow/lite/micro/esp/micro_time.cc>",
+      "+<tensorflow/lite/micro/kernels/*.cc>",
+      "-<tensorflow/lite/micro/kernels/add.cc>",
+      "-<tensorflow/lite/micro/kernels/conv.cc>",
+      "-<tensorflow/lite/micro/kernels/depthwise_conv.cc>",
+      "-<tensorflow/lite/micro/kernels/fully_connected.cc>",
+      "-<tensorflow/lite/micro/kernels/mul.cc>",
+      "-<tensorflow/lite/micro/kernels/pooling.cc>",
+      "-<tensorflow/lite/micro/kernels/softmax.cc>",
+      "+<tensorflow/lite/micro/kernels/esp_nn/*.cc>",
+      "+<tensorflow/lite/micro/tflite_bridge/*.cc>",
+      "+<tensorflow/lite/micro/memory_planner/greedy_memory_planner.cc>",
+      "+<tensorflow/lite/micro/memory_planner/linear_memory_planner.cc>",
+      "+<tensorflow/lite/micro/arena_allocator/*.cc>",
+      "+<tensorflow/lite/kernels/kernel_util.cc>",
+      "+<tensorflow/lite/core/c/common.cc>",
+      "+<tensorflow/lite/core/api/flatbuffer_conversions.cc>",
+      "+<tensorflow/lite/core/api/tensor_utils.cc>",
+      "+<tensorflow/lite/kernels/internal/common.cc>",
+      "+<tensorflow/lite/kernels/internal/quantization_util.cc>",
+      "+<tensorflow/lite/kernels/internal/portable_tensor_utils.cc>",
+      "+<tensorflow/lite/kernels/internal/tensor_utils.cc>",
+      "+<tensorflow/lite/kernels/internal/tensor_ctypes.cc>",
+      "+<tensorflow/lite/kernels/internal/reference/portable_tensor_utils.cc>",
+      "+<tensorflow/compiler/mlir/lite/core/api/error_reporter.cc>",
+      "+<tensorflow/compiler/mlir/lite/schema/schema_utils.cc>",
+      "+<tensorflow/lite/experimental/microfrontend/lib/*.c>",
+      "+<tensorflow/lite/experimental/microfrontend/lib/*.cc>",
+      "+<kissfft_int16/*.cc>"
+    ]
+  }
+}

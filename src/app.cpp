@@ -27,6 +27,7 @@
 #include "portal.h"
 #include "store.h"
 #include "ui.h"
+#include "wakeword.h"
 
 namespace app {
 namespace {
@@ -461,6 +462,38 @@ bool apply_sounds(JsonVariantConst sounds) {
   return complete;
 }
 
+// The wake word model (config "wake_word"): kept in flash like the sound clips; null = no wake word.
+String wake_model_url;  // the model loaded now
+
+bool apply_wake_word(JsonVariantConst w) {
+  const String url = w["url"] | "";
+  if (w.isNull() || !url.length()) {
+    if (wakeword::loaded()) LOGI(TAG, "wake word off");
+    wakeword::unload();
+    audio::removeSound("wakeword");
+    wake_model_url = "";
+    return true;
+  }
+  if (url == wake_model_url && wakeword::loaded()) return true;
+  size_t size = 0;
+  uint8_t* data = nullptr;
+  std::shared_ptr<ui::Blob> blob;
+  if (audio::soundSource("wakeword") == url) data = audio::readSound("wakeword", &size);
+  if (!data) {
+    blob = download(url);
+    if (!blob) return false;
+    audio::storeSound("wakeword", url, blob->data, blob->size);
+  }
+  const bool ok = wakeword::load(data ? data : blob->data, data ? size : blob->size, w["cutoff"] | 0.97f,
+                                 w["window"] | 5, w["arena"] | 30000);
+  free(data);
+  if (ok) {
+    wake_model_url = url;
+    LOGI(TAG, "wake word: %s", (const char*)(w["name"] | "?"));
+  }
+  return ok;
+}
+
 void apply_config(JsonDocument& doc) {
   JsonObject cfg = doc["config"];
   JsonObject display = cfg["display"];
@@ -491,6 +524,7 @@ void apply_config(JsonDocument& doc) {
   }
 
   bool complete = apply_sounds(doc["sounds"]);
+  complete &= apply_wake_word(doc["wake_word"]);
 
   // Character animations: download what changed, reuse the rest.
   ui::CharacterSet set;
@@ -833,6 +867,22 @@ void update_voice() {
     tap_requested = false;
     handle_tap();
   }
+  // The wake word listens only while the speaker is idle: not in a conversation, ringing, muted or making a sound
+  // (it would hear itself).
+  const bool idle = voice == Voice::Off && !ring_id.length() && !audio::micMuted() && !audio::speaking() &&
+                    !audio::playing();
+  wakeword::setListening(idle);
+  if (wakeword::takeDetection() && idle && ws_connected) {
+    board::markActivity();  // wake the screen
+    start_listening_turn();
+  }
+  static uint32_t last_stats = 0;
+  if (wakeword::loaded() && millis() - last_stats > 60000) {
+    last_stats = millis();
+    const wakeword::Stats st = wakeword::stats();
+    LOGI(TAG, "wake word: %u inferences in the last minute, %u us each, highest %u%%", st.inferences,
+         st.avg_infer_us, static_cast<unsigned>(st.max_probability * 100));
+  }
   if (voice == Voice::Starting && audio::micMuted()) {  // muted before listening began
     voice_done();
   } else if (voice == Voice::Starting && static_cast<int32_t>(millis() - voice_at) >= 0) {
@@ -1164,6 +1214,7 @@ void main_task(void*) {
 
   volume = store::volume(70);
   audio::soundsBegin();  // the sound pack's clips, before the boot sound plays
+  wakeword::begin();
   if (audio::begin()) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());
