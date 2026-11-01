@@ -138,11 +138,14 @@ size_t speech_dropped = 0;
 // The assistant's screen (screen): downloaded and shown from the main loop, taps reported back (screen_tap).
 struct PendingScreen {
   String id, url;
+  std::shared_ptr<ui::Blob> image;  // sent on the socket after the screen message; else downloaded from url
   std::vector<ui::TapRegion> regions;
   bool tap_dismisses = true;
   uint32_t seconds = 60;
 };
 std::unique_ptr<PendingScreen> pending_screen;
+std::unique_ptr<PendingScreen> receiving_screen;  // its picture is still arriving in binary frames
+size_t receiving_got = 0;
 String screen_id;
 uint32_t screen_until = 0;
 volatile bool screen_tapped = false;
@@ -909,7 +912,7 @@ void tap_screen(const String& label) {
 void update_screen() {
   if (pending_screen) {
     auto sc = std::move(pending_screen);
-    auto image = download(sc->url);
+    auto image = sc->image ? sc->image : download(sc->url);
     if (!image) {
       LOGW(TAG, "screen: couldn't download it");
     } else {
@@ -1046,7 +1049,21 @@ void handle_text(const uint8_t* payload, size_t len) {
       t.h = r["h"] | 0;
       if (t.label.length() && t.w > 0 && t.h > 0) sc->regions.push_back(t);
     }
-    if (sc->url.length()) pending_screen = std::move(sc);  // downloaded from the main loop
+    const size_t bytes = doc["bytes"] | 0;
+    receiving_screen.reset();
+    if (bytes > 0 && bytes <= MAX_ASSET_BYTES) {  // the picture follows in binary frames
+      sc->image = std::make_shared<ui::Blob>();
+      sc->image->data = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+      if (sc->image->data) {
+        sc->image->size = bytes;
+        receiving_got = 0;
+        receiving_screen = std::move(sc);
+      } else {
+        LOGW(TAG, "screen: out of PSRAM for %u bytes", static_cast<unsigned>(bytes));
+      }
+    } else if (sc->url.length()) {
+      pending_screen = std::move(sc);  // older servers: downloaded from the main loop
+    }
   } else if (type == "screen_clear") {
     pending_screen.reset();
     ui::hideScreen();
@@ -1118,13 +1135,22 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       if (ws_connected) LOGW(TAG, "connection to Harkenn lost");
       ws_connected = false;
       if (voice == Voice::Speaking) audio::endSpeech();  // play what arrived
+      receiving_screen.reset();                           // a picture cut off halfway
       if (!ws_down_since) ws_down_since = millis();
       break;
     case WStype_TEXT:
       handle_text(payload, len);
       break;
-    case WStype_BIN:  // speech for the current reply
-      if (voice == Voice::Speaking) speech_dropped += len - audio::writeSpeech(payload, len);
+    case WStype_BIN:
+      if (receiving_screen) {  // a screen's picture
+        ui::Blob& b = *receiving_screen->image;
+        const size_t n = min(len, b.size - receiving_got);
+        memcpy(b.data + receiving_got, payload, n);
+        receiving_got += n;
+        if (receiving_got == b.size) pending_screen = std::move(receiving_screen);
+      } else if (voice == Voice::Speaking) {  // speech for the current reply
+        speech_dropped += len - audio::writeSpeech(payload, len);
+      }
       break;
     default:
       break;
