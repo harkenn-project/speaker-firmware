@@ -20,6 +20,7 @@ constexpr int SAMPLE_RATE = 16000;
 constexpr int FEATURES = 40;                      // per 10 ms step
 constexpr size_t SAMPLE_BUFFER_BYTES = 32 * 1024;  // 1 s of slack
 constexpr uint32_t REFRACTORY_MS = 2000;            // after a detection, don't detect again for a while
+constexpr uint32_t WARM_UP_MS = 1000;               // after a pause, until the model has heard enough new audio
 constexpr int RESOURCE_VARIABLES = 20;
 
 // The features the models were trained on: TFLM's micro frontend with these settings.
@@ -95,12 +96,18 @@ void free_model(Model* m) {
   delete m;
 }
 
+// Forgets everything heard so far. The streaming model keeps the last second or two of audio in its own variables,
+// so without resetting those it would still "hear" the wake word that started the last conversation as soon as
+// listening resumes, and wake again.
 void reset_stream() {
   if (frontend_ok) FrontendReset(&frontend);
   if (model) {
     model->filled = 0;
     memset(model->recent, 0, sizeof(model->recent));
+    model->interpreter->Reset();
   }
+  quiet_until = millis() + WARM_UP_MS;
+  detected = false;
 }
 
 // One feature step into the model; runs it when a full stride has accumulated.
@@ -137,10 +144,11 @@ void task(void*) {
   for (;;) {
     const size_t n = xStreamBufferReceive(samples, buf, sizeof(buf), pdMS_TO_TICKS(100));
     const bool on = listening;
-    if (on && !was_listening) reset_stream();  // a fresh start after a pause: no stale audio
+    const bool resumed = on && !was_listening;
     was_listening = on;
-    if (!n || !on) continue;
+    if (!resumed && (!n || !on)) continue;
     xSemaphoreTake(lock, portMAX_DELAY);
+    if (resumed) reset_stream();  // a fresh start after a pause: no stale audio
     if (model && frontend_ok) {
       const int16_t* p = buf;
       size_t left = n / sizeof(int16_t);
