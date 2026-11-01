@@ -5,6 +5,12 @@ ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9
 protocol in [docs/PROTOCOL.md](https://github.com/harkenn-project/server-docker/blob/main/docs/PROTOCOL.md) of
 [server-docker](https://github.com/harkenn-project/server-docker), the server it talks to.
 
+<p align="center">
+  <a href="https://github.com/harkenn-project/server-docker/blob/main/docs/media/demo.mp4"><img src="https://raw.githubusercontent.com/harkenn-project/server-docker/main/docs/media/demo-poster.jpg" width="240"
+    alt="A Harkenn speaker on a shelf, its round screen showing the Kotodama character listening (click to play the video)"></a>
+  <br><em>A speaker introducing itself (1:39, with sound).</em>
+</p>
+
 ## What it does
 
 1. **Wi-Fi.** With no saved network, it opens the access point `Harkenn-XXXX`. Join it, and a page at
