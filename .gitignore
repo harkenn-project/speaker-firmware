@@ -1,3 +1,5 @@
 .venv/
 .pio/
 .releases/
+__pycache__/
+build.log

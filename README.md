@@ -5,7 +5,7 @@ ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9
 protocol in [docs/PROTOCOL.md](https://github.com/harkenn-project/server-docker/blob/main/docs/PROTOCOL.md) of
 [server-docker](https://github.com/harkenn-project/server-docker), the server it talks to.
 
-## What it does (v0.6)
+## What it does
 
 1. **Wi-Fi.** With no saved network, it opens the access point `Harkenn-XXXX`. Join it, and a page at
    `http://192.168.4.1` lets you pick a network. Networks pushed from the server are added to the saved list and never
@@ -13,24 +13,33 @@ protocol in [docs/PROTOCOL.md](https://github.com/harkenn-project/server-docker/
 2. **Find the server.** It tries a saved address, then the `_harkenn._tcp` mDNS service, `harkenn.local`, and finally
    the DNS name `harkenn`, until a Harkenn server answers `/api/v1/ping`; it sets its clock from the reply. The setup
    page's *Advanced* field saves an address, and the server sends its own address in the config.
-3. **Adoption.** It shows a 3-digit code. You enter the code in Harkenn, and the device saves its token in NVS.
-4. **Online.** It loads its config, downloads the character animations (KANI, see `app/kani.py`) at the size the layout needs, and draws the layout.
-   It then holds a WebSocket to Harkenn:
+3. **Adoption.** It shows a 3-digit code. You enter the code in Harkenn, and the speaker saves its token in NVS.
+4. **Online.** It loads its config and downloads what it needs: the character animations (KANI, see `app/kani.py` in
+   server-docker) at the size the layout needs, the sound pack's clips (kept in flash) and the wake word model. Its
+   boot sound plays once all of that is in. It then holds a WebSocket to Harkenn:
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.
    - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and
      `update_firmware` (see *Updates* below).
    - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
-5. **Talking.** Tap the middle to talk: a chime, then it streams what it hears to Harkenn until you tap again or stop speaking for
-   `audio.silence_s` (default 5 s, at most 30 s). Harkenn answers with speech, which the speaker plays while the character
-   talks; a tap stops it. Drag around the edge
-   to change the volume; the speaker's own volume wins over the config unless the volume in the config changes.
-6. **BOOT button.**
-   - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
-   - Hold 5 s: opens Wi-Fi setup on the next boot, keeping saved networks.
-   - Hold 10 s: factory reset, forgetting Wi-Fi, the token and the server URL.
-
-Not yet implemented: wake word, configurable sounds.
+5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
+   while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
+   in the config.
+6. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
+   until you stop talking (Harkenn decides when, after `audio.silence_s` of silence) or tap again. Harkenn answers
+   with speech, which the speaker plays while the character talks; a tap stops it. When the assistant asks
+   something, the speaker plays a soft cue and listens for the answer without the wake word.
+7. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
+   home screen until it's dismissed or times out; tapping an area sends its label back as the next turn.
+8. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
+   taps to answer.
+9. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
+   wins over the config unless the volume in the config changes.
+10. **BOOT button.**
+    - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
+    - Hold 3 s: power off (a press turns it back on).
+    - Hold 6 s: opens Wi-Fi setup on the next boot, keeping saved networks.
+    - Hold 11 s: factory reset, forgetting Wi-Fi, the token and the server URL.
 
 ## Build and flash
 
@@ -50,8 +59,8 @@ After the first USB flash, update over Wi-Fi: upload `.pio/build/harkenn-speaker
 restarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build
 you upload (Harkenn reads it from the image).
 
-**Releases.** Published releases live on this repo's `releases` branch as `latest.json` plus
-`v<version>/firmware.bin`. After building a new `FW_VERSION`:
+**Releases.** Published releases live on this repo's `releases` branch as `latest.json` (and one manifest per
+pre-release channel) plus `v<version>/firmware.bin`. After building a new `FW_VERSION`:
 
 ```
 python tools/publish_release.py --push
@@ -83,6 +92,9 @@ To restore the stock XiaoZhi firmware, write the full backup back to address 0 w
 ## Notes
 
 - `src/ca_certs.h` holds the Let's Encrypt roots (ISRG Root X1 and X2) used to verify the server.
+- Internal RAM is tight: each TLS connection needs tens of KB of it. The wake word's tensor arena and other large
+  buffers live in PSRAM, and screens arrive over the WebSocket rather than a second HTTPS download.
+- `lib/tflm` and `lib/esp-nn` are vendored by `tools/vendor_tflm.py`.
 - If the picture comes out rotated or mirrored, change `DISPLAY_ROTATION` in `src/board.cpp`. Values 4-7 are the
   mirrored variants.
 - Battery percentage assumes a 1:2 divider on GPIO1. Charging is read from GPIO41, assumed active-low. Both still
