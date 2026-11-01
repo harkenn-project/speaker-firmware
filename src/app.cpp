@@ -82,6 +82,7 @@ uint32_t sleep_after_ms = 300000;
 uint32_t silence_ms = 5000;  // stop listening after this long without speech
 bool dimmed = false;
 std::map<String, std::shared_ptr<ui::Blob>> blobs;  // animations by URL, so unchanged ones aren't downloaded again
+ui::CharacterSet shown;  // the animations on screen, kept for a state whose new download fails
 
 // Live connection
 WebSocketsClient ws;
@@ -451,6 +452,7 @@ void apply_config(JsonDocument& doc) {
   // Character animations: download what changed, reuse the rest.
   ui::CharacterSet set;
   std::map<String, std::shared_ptr<ui::Blob>> next;
+  bool complete = true;
   if (character_size) {
     JsonObject states = doc["character"]["states"];
     for (size_t i = 0; i < ui::STATE_COUNT; i++) {
@@ -460,7 +462,15 @@ void apply_config(JsonDocument& doc) {
       if (have == next.end()) {
         auto old = blobs.find(url);
         auto blob = old != blobs.end() ? old->second : download(url);
-        if (!blob) continue;
+        if (!blob) {
+          delay(500);
+          blob = download(url);  // one retry: a download can fail while the live connection is still starting
+        }
+        if (!blob) {
+          set[i] = shown[i];  // keep what was there; the next config tries again
+          complete = false;
+          continue;
+        }
         have = next.emplace(url, blob).first;
       }
       set[i] = have->second;
@@ -496,6 +506,7 @@ void apply_config(JsonDocument& doc) {
     LOGI(TAG, "Wi-Fi list updated: %u networks", store::wifiNetworks().size());
   }
 
+  shown = set;
   ui::setCharacter(set);
   ui::showLayout(theme, widgets, display["clock_24h"] | true);
   dimmed = false;
@@ -509,7 +520,7 @@ void apply_config(JsonDocument& doc) {
     store::setAnnouncedServerUrl(announced);
     LOGI(TAG, "server's public address: %s", announced.c_str());
   }
-  applied_key = config_key(doc);
+  applied_key = complete ? config_key(doc) : String();  // incomplete: don't skip the same config next time
   LOGI(TAG, "applied config v%d (layout %s, character %s)", config_version, (const char*)(doc["layout"]["id"] | "?"),
        (const char*)(doc["character"]["id"] | "?"));
 }
