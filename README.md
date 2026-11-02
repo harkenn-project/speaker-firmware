@@ -5,6 +5,11 @@ ES8311 codec. It is built with PlatformIO on the Arduino framework, using LVGL 9
 protocol in [docs/PROTOCOL.md](https://github.com/harkenn-project/server-docker/blob/main/docs/PROTOCOL.md) of
 [server-docker](https://github.com/harkenn-project/server-docker), the server it talks to.
 
+**Where to get one:** on AliExpress, as
+[*Superior-ESP32 S3 1.28 Inch LCD Touch Screen Mini Speaker ESP32 S3 Xiaozhi AI Mini Speaker Support Deepseek*](https://www.aliexpress.com/item/1005010093339429.html)
+(CA$41 when we bought ours). Check it's the 1.28" BOX: similar-looking Spotpear boxes with a 1.85" screen or no screen aren't
+supported.
+
 <p align="center">
   <a href="https://github.com/harkenn-project/server-docker/blob/main/docs/media/demo.mp4"><img src="https://raw.githubusercontent.com/harkenn-project/server-docker/main/docs/media/demo-poster.jpg" width="240"
     alt="A Harkenn speaker on a shelf, its round screen showing the Kotodama character listening (click to play the video)"></a>
