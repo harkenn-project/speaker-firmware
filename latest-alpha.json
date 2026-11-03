@@ -1,7 +1,12 @@
 {
-  "version": "0.12.0-alpha.1",
+  "version": "0.13.0-alpha.1",
   "hardware": "sp-esp32-s3-1.28-box",
-  "file": "v0.12.0-alpha.1/firmware.bin",
-  "size": 2142704,
-  "sha256": "448eade2cd92a751d06a63f7eb7bec93187838babb980eafb14044a348eec03f"
+  "file": "v0.13.0-alpha.1/firmware.bin",
+  "size": 2240784,
+  "sha256": "e06bac72a8c0ac3150f80823c285cb3096fb74c12302b8e564521a02927ab560",
+  "install": {
+    "file": "v0.13.0-alpha.1/harkenn-speaker-0.13.0-alpha.1-install.bin",
+    "size": 2306320,
+    "sha256": "1184c28137d4bb1e2fa261db637785f98de8f63d671a44a76d712e5a755c3710"
+  }
 }
