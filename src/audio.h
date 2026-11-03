@@ -60,13 +60,22 @@ void endSpeech();
 void stopSpeech();
 bool speaking();
 
-// Wake word arbitration (app.cpp). When several speakers hear the wake word, the one that heard it loudest plays
-// the Claim tone first (CLAIM_HZ, above hearing); the others hear it and stay quiet.
-constexpr int CLAIM_HZ = 19000;
-constexpr uint32_t CLAIM_MS = 80;
-uint32_t claimHeardAt();  // millis() when another speaker's tone was last heard; 0 if never
-int claimLevel();         // how strong the strongest tone heard since the last call was (amplitude, out of 32767)
-// The loudest 100 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
+// Wake word arbitration (app.cpp): speakers that heard the wake word tell each other how loudly, above hearing.
+// A claim is three short tones: CLAIM_HZ[0]; CLAIM_HZ[1] exactly CLAIM_AB_MS later (the signature: a stray tone
+// can't pass for it); then CLAIM_HZ[2], CLAIM_BC_MS + level x CLAIM_SLOT_MS after that, which says how loud the
+// wake word was (level 0 the loudest, CLAIM_LEVELS - 1 the quietest).
+constexpr int CLAIM_HZ[3] = {18600, 19200, 19800};
+constexpr uint32_t CLAIM_TONE_MS = 30, CLAIM_AB_MS = 50, CLAIM_BC_MS = 40, CLAIM_SLOT_MS = 10;
+constexpr int CLAIM_LEVELS = 16;
+void claim(int level);        // plays our claim, at full level whatever the volume
+uint32_t claimMs(int level);  // how long it takes
+struct HeardClaim {
+  uint32_t at = 0;    // millis() when it was heard (its last tone); 0 if none yet
+  int level = -1;     // 0 = the loudest
+  int strength = 0;   // how strong its first tone was here (amplitude, out of 32767)
+};
+HeardClaim lastClaim();  // the last claim heard from another speaker
+// The loudest 16 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
 int recentLevelDb();
 
 }  // namespace audio

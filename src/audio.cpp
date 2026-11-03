@@ -218,25 +218,37 @@ void write_samples(const int16_t* data, size_t count) {  // 16 kHz
   }
 }
 
-// The claim tone: CLAIM_HZ for CLAIM_MS with soft edges (no click), at full level whatever the volume.
-volatile uint32_t claiming_until = 0;  // the capture task ignores what it hears of our own tone
+// Our claim (audio.h): three tones with soft edges (no clicks), at full level whatever the volume.
+volatile uint32_t claiming_until = 0;  // the capture task ignores what it hears of our own claim
+volatile int claim_level = 0;          // for the queued Sound::Claim
 
-void render_claim() {
+uint32_t claim_start_ms(int tone, int level) {
+  return tone == 0 ? 0 : tone == 1 ? CLAIM_AB_MS : CLAIM_AB_MS + CLAIM_BC_MS + level * CLAIM_SLOT_MS;
+}
+
+void render_claim(int level) {
   static int16_t buf[CHUNK * RATIO];
-  const uint32_t total = HW_RATE * CLAIM_MS / 1000, ramp = HW_RATE * 8 / 1000;
-  const float w = 2.0f * PI * CLAIM_HZ / HW_RATE;
-  claiming_until = millis() + CLAIM_MS + 120;
-  wr(0x32, 0xBF);  // DAC at 0 dB for the tone
+  const uint32_t tone_len = HW_RATE * CLAIM_TONE_MS / 1000, ramp = HW_RATE * 5 / 1000;
+  uint32_t start[3];
+  for (int t = 0; t < 3; t++) start[t] = HW_RATE * claim_start_ms(t, level) / 1000;
+  const uint32_t total = start[2] + tone_len;
+  claiming_until = millis() + total * 1000 / HW_RATE + 150;
+  wr(0x32, 0xBF);  // DAC at 0 dB for the tones
   for (uint32_t i = 0; i < total;) {
     const size_t m = min<uint32_t>(CHUNK * RATIO, total - i);
     for (size_t k = 0; k < m; k++, i++) {
-      const uint32_t edge = min(i, total - 1 - i);
-      const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
-      buf[k] = static_cast<int16_t>(23000.0f * env * sinf(w * i));
+      float v = 0;
+      for (int t = 0; t < 3; t++) {
+        if (i < start[t] || i >= start[t] + tone_len) continue;
+        const uint32_t at = i - start[t], edge = min(at, tone_len - 1 - at);
+        const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
+        v = 23000.0f * env * sinf(2.0f * PI * CLAIM_HZ[t] * at / HW_RATE);
+      }
+      buf[k] = static_cast<int16_t>(v);
     }
     write_raw(buf, m);
   }
-  claiming_until = millis() + 120;  // what's still in the DMA buffers, and the echo
+  claiming_until = millis() + 150;  // what's still in the DMA buffers, and the echo
 }
 
 void render(const Note* notes) {
@@ -314,7 +326,7 @@ void play_task(void*) {
       if (s == Sound::Claim) {  // inaudible: played whatever the volume
         sound_playing = true;
         amp(true);
-        render_claim();
+        render_claim(claim_level);
         apply_volume();
         sound_playing = false;
         continue;
@@ -380,16 +392,19 @@ bool is_speech(const int16_t* s, size_t n) {
   return speech;
 }
 
-// Listening for other speakers' claim tones in the 48 kHz audio: Goertzel filters at the tone and at a reference
-// frequency below it, over 10 ms blocks. A tone is heard when it's well above the reference (broadband noise) and
-// a minimum level for 3 blocks in a row.
-constexpr int TONE_BLOCK = HW_RATE / 100;
+// Listening for other speakers' claims in the 48 kHz audio: Goertzel filters at the three tones and at a reference
+// frequency below them, over 5 ms blocks. A tone starts when it's the strongest of the three, well above the
+// reference (broadband noise) and a minimum level, for 3 blocks in a row; a claim is the three starting in order, the
+// second CLAIM_AB_MS after the first, the third CLAIM_BC_MS plus its level's slots after that.
+constexpr int BLOCK_MS = 5;
+constexpr int TONE_BLOCK = HW_RATE * BLOCK_MS / 1000;
 constexpr int REF_HZ = 17000;
 constexpr float TONE_MIN_AMP = 30.0f;  // out of 32767
 constexpr float TONE_OVER_REF = 4.0f;
-constexpr int TONE_BLOCKS = 3;
-volatile uint32_t claim_heard_at = 0;
-volatile int claim_peak = 0;
+constexpr int ONSET_BLOCKS = 3;
+constexpr int32_t SLACK_MS = 12;  // timing tolerance
+portMUX_TYPE heard_lock = portMUX_INITIALIZER_UNLOCKED;
+HeardClaim heard;
 
 struct Goertzel {
   float coeff, s1 = 0, s2 = 0;
@@ -406,22 +421,60 @@ struct Goertzel {
   }
 };
 
+// A tone started (at `t` ms, on the block clock): advance through the claim's three tones.
+void tone_started(int tone, int32_t t, float amp) {
+  static int stage = 0;  // tones of a claim seen so far
+  static int32_t t_a = 0, t_b = 0;
+  static float strength = 0;
+  if (stage && t - (stage == 1 ? t_a : t_b) > 400) stage = 0;  // too long since: start over
+  if (tone == 0) {
+    stage = 1;
+    t_a = t;
+    strength = amp;
+  } else if (tone == 1 && stage == 1 && abs(t - t_a - static_cast<int32_t>(CLAIM_AB_MS)) <= SLACK_MS) {
+    stage = 2;
+    t_b = t;
+  } else if (tone == 2 && stage == 2) {
+    const int32_t delay = t - t_b - CLAIM_BC_MS;
+    const int level = (delay + static_cast<int32_t>(CLAIM_SLOT_MS) / 2) / static_cast<int32_t>(CLAIM_SLOT_MS);
+    if (delay >= -SLACK_MS && level < CLAIM_LEVELS) {
+      HeardClaim c;
+      c.at = millis() | 1;  // never 0
+      c.level = max(level, 0);
+      c.strength = static_cast<int>(strength);
+      portENTER_CRITICAL(&heard_lock);
+      heard = c;
+      portEXIT_CRITICAL(&heard_lock);
+    }
+    stage = 0;
+  } else {
+    stage = 0;  // out of order: not a claim
+  }
+}
+
 void listen_for_claims(const int16_t* raw, size_t n) {
-  static Goertzel tone(CLAIM_HZ), ref(REF_HZ);
-  static int count = 0, run = 0;
+  static Goertzel tones[3] = {Goertzel(CLAIM_HZ[0]), Goertzel(CLAIM_HZ[1]), Goertzel(CLAIM_HZ[2])};
+  static Goertzel ref(REF_HZ);
+  static int count = 0;
+  static int32_t block = 0;
+  static int run[3] = {0, 0, 0};
   for (size_t i = 0; i < n; i++) {
-    tone.add(raw[i]);
+    for (Goertzel& g : tones) g.add(raw[i]);
     ref.add(raw[i]);
     if (++count < TONE_BLOCK) continue;
     count = 0;
-    const float t = tone.amplitude(), r = ref.amplitude();
-    const bool ours = static_cast<int32_t>(claiming_until - millis()) > 0;
-    if (!ours && t > TONE_MIN_AMP && t > TONE_OVER_REF * r) {
-      if (t > claim_peak) claim_peak = static_cast<int>(t);
-      if (++run == TONE_BLOCKS) claim_heard_at = millis() | 1;  // never 0
-    } else {
-      run = 0;
+    block++;
+    float amp[3];
+    int best = 0;
+    for (int t = 0; t < 3; t++) {
+      amp[t] = tones[t].amplitude();
+      if (amp[t] > amp[best]) best = t;
     }
+    const float r = ref.amplitude();
+    const bool ours = static_cast<int32_t>(claiming_until - millis()) > 0;
+    const bool present = !ours && amp[best] > TONE_MIN_AMP && amp[best] > TONE_OVER_REF * r;
+    for (int t = 0; t < 3; t++) run[t] = present && t == best ? run[t] + 1 : 0;
+    if (present && run[best] == ONSET_BLOCKS) tone_started(best, (block - ONSET_BLOCKS + 1) * BLOCK_MS, amp[best]);
   }
 }
 
@@ -526,7 +579,7 @@ uint32_t soundMs(Sound sound) {
     f.close();
     return ms;
   }
-  if (sound == Sound::Claim) return CLAIM_MS;
+  if (sound == Sound::Claim) return claimMs(claim_level);
   uint32_t ms = 0;
   for (const Note* n = notes_for(sound); n->ms; n++) ms += n->ms;
   return ms;
@@ -644,12 +697,20 @@ void stopSpeech() {
 
 bool speaking() { return speech_on; }
 
-uint32_t claimHeardAt() { return claim_heard_at; }
+void claim(int level) {
+  if (!ok) return;
+  claim_level = constrain(level, 0, CLAIM_LEVELS - 1);
+  const Sound s = Sound::Claim;
+  xQueueSend(queue, &s, 0);
+}
 
-int claimLevel() {
-  const int peak = claim_peak;
-  claim_peak = 0;
-  return peak;
+uint32_t claimMs(int level) { return claim_start_ms(2, constrain(level, 0, CLAIM_LEVELS - 1)) + CLAIM_TONE_MS; }
+
+HeardClaim lastClaim() {
+  portENTER_CRITICAL(&heard_lock);
+  const HeardClaim c = heard;
+  portEXIT_CRITICAL(&heard_lock);
+  return c;
 }
 
 int recentLevelDb() {

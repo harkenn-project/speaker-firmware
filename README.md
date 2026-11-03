@@ -38,10 +38,11 @@ supported.
 5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
    while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
    in the config.
-6. **Only the nearest answers.** When several speakers hear the wake word, the one that heard it loudest answers:
-   it plays a short tone at 19 kHz, too high for people to hear, and the others stand down (Harkenn's
-   `audio.wake_arbitration`, on by default). The codec runs at 48 kHz for this, filtered to 16 kHz for everything
-   else.
+6. **Only the nearest answers.** When several speakers hear the wake word, the one that heard it loudest answers.
+   Each plays a *claim* the others can hear but people can't: three short tones between 18.6 and 19.8 kHz, the first
+   two a fixed 50 ms apart (so a stray tone can't pass for one), the third later the quieter the speaker heard the
+   word. Strongest wins: the others stay quiet, or stop if they'd started (Harkenn's `audio.wake_arbitration`, on by
+   default). The codec runs at 48 kHz for this, filtered to 16 kHz for everything else.
 7. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
    until you stop talking (Harkenn decides when, after `audio.silence_s` of silence) or tap again. Harkenn answers
    with speech, which the speaker plays while the character talks; a tap stops it. When the assistant asks

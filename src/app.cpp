@@ -1105,29 +1105,88 @@ void start_listening_turn(bool after_speech = false, bool follow_up = false, uin
 }
 
 // Wake word arbitration: when several speakers hear the wake word, only the one that heard it loudest answers.
-// Each waits longer the quieter it heard it, then plays the claim tone (above hearing) and answers; a speaker that
-// hears another's tone first, or heard one just before (wake word detection takes a little longer on some
-// speakers), stays quiet.
-constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: no wait
-constexpr uint32_t ARBITRATION_MS_PER_DB = 12;
-constexpr uint32_t ARBITRATION_MAX_MS = 360;
-constexpr uint32_t ARBITRATION_JITTER_MS = 20;  // two speakers that heard it equally loud rarely claim together
-constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;
+// Each turns how loud it heard the word into a level (0 the loudest, 2 dB a level), waits longer the higher its
+// level, then plays its claim (three tones above hearing that carry the level; audio.h) and answers. Strongest
+// wins:
+// - before claiming, a speaker that hears a claim as strong as its own, or stronger, stays quiet;
+// - one that hears a weaker claim (that speaker caught the word sooner) claims at once;
+// - after claiming, a speaker that hears a stronger claim within CHALLENGE_MS stops answering and goes back to idle.
+constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: level 0
+constexpr int ARBITRATION_DB_PER_LEVEL = 2;
+constexpr uint32_t ARBITRATION_MS_PER_LEVEL = 25;
+constexpr uint32_t ARBITRATION_JITTER_MS = 20;  // two speakers at the same level rarely claim together
+constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;    // a claim heard this long before we caught the word still counts
+constexpr uint32_t CHALLENGE_MS = 1500;         // after our claim, a stronger one still takes over
+int my_level = 0;
+uint32_t claimed_at = 0;  // when we claimed; 0 = no claim of ours in play
+
+int level_for(int db) {
+  return constrain((ARBITRATION_LOUD_DB - db + ARBITRATION_DB_PER_LEVEL - 1) / ARBITRATION_DB_PER_LEVEL, 0,
+                   audio::CLAIM_LEVELS - 1);
+}
 
 void arbitrate() {
   const int db = audio::recentLevelDb();
-  audio::claimLevel();  // start the peak over
-  const uint32_t heard = audio::claimHeardAt();
-  if (heard && millis() - heard < CLAIM_LOOKBACK_MS) {
-    LOGI(TAG, "wake word at %d dBFS: a closer speaker already answered; staying quiet", db);
-    return;
+  my_level = level_for(db);
+  claimed_at = 0;
+  uint32_t wait = my_level * ARBITRATION_MS_PER_LEVEL + esp_random() % ARBITRATION_JITTER_MS;
+  const audio::HeardClaim heard = audio::lastClaim();
+  if (heard.at && millis() - heard.at < CLAIM_LOOKBACK_MS) {
+    if (heard.level <= my_level) {
+      LOGI(TAG, "wake word at %d dBFS (level %d): another speaker heard it at level %d and is answering; staying quiet",
+           db, my_level, heard.level);
+      return;
+    }
+    wait = 0;  // we heard it better than the speaker answering: take over
   }
-  const uint32_t wait = min<uint32_t>(max(0, ARBITRATION_LOUD_DB - db) * ARBITRATION_MS_PER_DB, ARBITRATION_MAX_MS) +
-                        esp_random() % ARBITRATION_JITTER_MS;
-  LOGI(TAG, "wake word at %d dBFS: answering in %u ms unless a closer speaker does", db, static_cast<unsigned>(wait));
+  LOGI(TAG, "wake word at %d dBFS (level %d): answering in %u ms unless a closer speaker does", db, my_level,
+       static_cast<unsigned>(wait));
   arbitration_started = millis();
   voice = Voice::Arbitrating;
   voice_at = millis() + wait;
+}
+
+// Another speaker heard the wake word better: stop whatever we started, quietly.
+void stand_down(const audio::HeardClaim& other) {
+  LOGI(TAG, "wake word: another speaker heard it better (level %d, ours %d, its signal %d here); standing down",
+       other.level, my_level, other.strength);
+  if (voice == Voice::Listening) {
+    audio::stopListening();
+    send_voice("voice_cancel");
+  } else if (voice == Voice::Waiting) {
+    send_voice("voice_cancel");
+  } else if (voice == Voice::Speaking) {
+    audio::stopSpeech();
+    send_voice("speak_stop");
+  }
+  claimed_at = 0;
+  listen_after_speech = false;
+  voice_done();
+}
+
+void update_arbitration() {
+  const audio::HeardClaim heard = audio::lastClaim();
+  if (voice == Voice::Arbitrating) {
+    if (heard.at && static_cast<int32_t>(heard.at - arbitration_started) >= 0) {
+      if (heard.level <= my_level) {  // as strong or stronger, and first
+        stand_down(heard);
+        return;
+      }
+      voice_at = millis();  // weaker: claim now, so it stands down
+    }
+    if (static_cast<int32_t>(millis() - voice_at) >= 0) {
+      audio::claim(my_level);  // tell the others, then answer
+      claimed_at = millis() | 1;
+      board::markActivity();
+      start_listening_turn(false, false, audio::claimMs(my_level));
+    }
+  } else if (claimed_at) {
+    if (voice == Voice::Off || millis() - claimed_at > CHALLENGE_MS) {
+      claimed_at = 0;
+    } else if (heard.at && static_cast<int32_t>(heard.at - claimed_at) > 0 && heard.level < my_level) {
+      stand_down(heard);  // a stronger claim after ours
+    }
+  }
 }
 
 void handle_tap() {
@@ -1295,16 +1354,7 @@ void update_voice() {
       start_listening_turn();
     }
   }
-  if (voice == Voice::Arbitrating) {
-    if (audio::claimHeardAt() && static_cast<int32_t>(audio::claimHeardAt() - arbitration_started) >= 0) {
-      LOGI(TAG, "wake word: a closer speaker is answering (its tone at %d); staying quiet", audio::claimLevel());
-      voice = Voice::Off;
-    } else if (static_cast<int32_t>(millis() - voice_at) >= 0) {
-      audio::play(audio::Sound::Claim);  // tell the others, then answer
-      board::markActivity();
-      start_listening_turn(false, false, audio::CLAIM_MS);
-    }
-  }
+  update_arbitration();
   static uint32_t last_stats = 0;
   if (wakeword::loaded() && millis() - last_stats > 60000) {
     last_stats = millis();
