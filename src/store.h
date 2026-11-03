@@ -87,6 +87,10 @@ uint32_t localChangesId();
 void setLocalChanges(const String& json);  // gets a new id
 void clearLocalChanges(uint32_t id);       // only if nothing changed since that id
 
+// Whether the codec runs at 48 kHz for wake word arbitration (config audio.wake_arbitration); read at startup.
+bool ultrasonic();
+void setUltrasonic(bool on);
+
 void factoryReset();  // forget everything: Wi-Fi, token, server URL, passwords
 
 }  // namespace store

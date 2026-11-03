@@ -219,6 +219,7 @@ bool update_checked = false;  // asked Harkenn for updates since boot
 
 enum class Voice { Off, Arbitrating, Starting, Listening, Waiting, Speaking };
 bool wake_arbitration = true;      // config audio.wake_arbitration: only the nearest speaker answers (arbitrate())
+bool audio_restart_wanted = false;  // it changed: restart, so the codec runs at the rate it needs
 uint32_t arbitration_started = 0;
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
@@ -846,6 +847,10 @@ void apply_config(JsonDocument& doc) {
   ui::showSleepClock(false);  // the config wakes the screen (below)
   silence_ms = constrain(cfg["audio"]["silence_s"] | 5, 1, 30) * 1000;
   wake_arbitration = cfg["audio"]["wake_arbitration"] | true;
+  if (wake_arbitration != store::ultrasonic()) {  // the codec's rate is set at startup
+    store::setUltrasonic(wake_arbitration);
+    audio_restart_wanted = true;
+  }
   // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
   const int config_volume = constrain(cfg["audio"]["volume"] | 70, 0, 100);
   if (config_volume != store::configVolume()) {
@@ -1347,7 +1352,7 @@ void update_voice() {
                     !audio::playing();
   wakeword::setListening(idle);
   if (wakeword::takeDetection() && idle && ws_connected) {
-    if (wake_arbitration) {
+    if (wake_arbitration && audio::ultrasonic()) {
       arbitrate();
     } else {
       board::markActivity();  // wake the screen
@@ -1359,6 +1364,9 @@ void update_voice() {
   if (wakeword::loaded() && millis() - last_stats > 60000) {
     last_stats = millis();
     const wakeword::Stats st = wakeword::stats();
+    const audio::MicStats mic = audio::micStats();
+    LOGI(TAG, "mic (%s kHz): average %d dBFS, loudest %d dBFS, noise floor %d", audio::ultrasonic() ? "48" : "16",
+         mic.average_db, mic.loudest_db, mic.noise_floor);
     LOGI(TAG, "wake word: %u inferences in the last minute, %u us each, highest %u%%", st.inferences,
          st.avg_infer_us, static_cast<unsigned>(st.max_probability * 100));
   }
@@ -1766,6 +1774,12 @@ bool run_online(bool use_relay = false) {
       ws.disconnect();
       return true;  // starts over with the new server address
     }
+    if (audio_restart_wanted && voice == Voice::Off) {
+      LOGI(TAG, "only the nearest answers: %s; restarting so the audio runs at %s kHz", wake_arbitration ? "on" : "off",
+           wake_arbitration ? "48" : "16");
+      flush_logs();
+      restart();
+    }
     if (factory_reset_wanted) {
       LOGW(TAG, "factory reset requested by Harkenn");
       flush_logs();
@@ -1945,7 +1959,7 @@ void main_task(void*) {
   volume = store::volume(70);
   audio::soundsBegin();  // the sound pack's clips, before the boot sound plays
   wakeword::begin();
-  if (audio::begin()) {
+  if (audio::begin(store::ultrasonic())) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());
   }

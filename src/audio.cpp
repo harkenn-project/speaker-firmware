@@ -19,6 +19,7 @@ constexpr const char* TAG = "audio";
 constexpr uint8_t ES8311 = 0x18;
 constexpr size_t CHUNK = 256;            // 16 kHz samples per write/read (16 ms)
 constexpr int RATIO = HW_RATE / SAMPLE_RATE;
+int ratio = RATIO;  // codec rate / 16 kHz: 3, or 1 when it runs at 16 kHz (no wake word arbitration; begin())
 constexpr uint32_t AMP_OFF_AFTER_MS = 200;  // after the last sound, so the DMA buffers drain first
 
 i2s_chan_handle_t tx = nullptr, rx = nullptr;
@@ -91,7 +92,7 @@ bool i2s_init() {
   chan.auto_clear = true;  // send silence when nothing is queued, instead of repeating the last buffer
   if (i2s_new_channel(&chan, &tx, &rx) != ESP_OK) return false;
   i2s_std_config_t std = {
-      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(HW_RATE),
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(static_cast<uint32_t>(SAMPLE_RATE * ratio)),
       .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
       .gpio_cfg =
           {
@@ -137,6 +138,10 @@ int16_t clip16(float v) { return static_cast<int16_t>(constrain(v, -32768.0f, 32
 // 48 kHz in (n samples, a multiple of RATIO), 16 kHz out.
 void decimate(const int16_t* in, size_t n, int16_t* out) {
   static float ext[TAPS - 1 + CHUNK * RATIO];  // the last TAPS-1 inputs, then this block
+  if (ratio == 1) {
+    memcpy(out, in, n * sizeof(int16_t));
+    return;
+  }
   for (size_t i = 0; i < n; i++) ext[TAPS - 1 + i] = in[i];
   for (size_t j = 0; j < n / RATIO; j++) {
     const float* x = ext + TAPS - 1 + RATIO * j + RATIO - 1;
@@ -150,6 +155,10 @@ void decimate(const int16_t* in, size_t n, int16_t* out) {
 // 16 kHz in (n samples), 48 kHz out (n * RATIO). Only the play task calls it.
 void interpolate(const int16_t* in, size_t n, int16_t* out) {
   static float ext[PHASE_TAPS - 1 + CHUNK];
+  if (ratio == 1) {
+    memcpy(out, in, n * sizeof(int16_t));
+    return;
+  }
   for (size_t i = 0; i < n; i++) ext[PHASE_TAPS - 1 + i] = in[i];
   for (size_t i = 0; i < n; i++) {
     const float* x = ext + PHASE_TAPS - 1 + i;
@@ -214,7 +223,7 @@ void write_samples(const int16_t* data, size_t count) {  // 16 kHz
   for (size_t i = 0; i < count; i += CHUNK) {
     const size_t m = min(CHUNK, count - i);
     interpolate(data + i, m, out);
-    write_raw(out, m * RATIO);
+    write_raw(out, m * ratio);
   }
 }
 
@@ -374,6 +383,10 @@ constexpr float SPEECH_RATIO = 3.0f;
 constexpr float MIN_SPEECH_LEVEL = 250.0f;  // mean absolute amplitude, out of 32767
 float noise_floor = 200.0f;
 
+// The microphone's level since micStats() was last called.
+float stats_sum = 0, stats_max = 0;
+uint32_t stats_count = 0;
+
 // The level of each chunk over the last 1.5 s, for recentLevelDb().
 constexpr size_t LEVELS = SAMPLE_RATE * 3 / 2 / CHUNK;
 uint16_t levels[LEVELS];
@@ -385,6 +398,9 @@ bool is_speech(const int16_t* s, size_t n) {
   const float level = sum / n;
   levels[level_at] = static_cast<uint16_t>(level);
   level_at = (level_at + 1) % LEVELS;
+  stats_sum += level;
+  stats_count++;
+  if (level > stats_max) stats_max = level;
   const bool speech = level > noise_floor * SPEECH_RATIO && level > MIN_SPEECH_LEVEL;
   if (level < noise_floor) noise_floor += (level - noise_floor) * 0.1f;
   else if (!speech) noise_floor += (level - noise_floor) * 0.01f;
@@ -483,11 +499,14 @@ void capture_task(void*) {
   static int16_t buf[CHUNK];
   for (;;) {
     size_t got_raw = 0;
-    if (i2s_channel_read(rx, raw, sizeof(raw), &got_raw, pdMS_TO_TICKS(200)) != ESP_OK || !got_raw) continue;
-    const size_t n_raw = got_raw / sizeof(int16_t) / RATIO * RATIO;
-    if (!mic_muted) listen_for_claims(raw, n_raw);
+    if (i2s_channel_read(rx, raw, CHUNK * ratio * sizeof(int16_t), &got_raw, pdMS_TO_TICKS(200)) != ESP_OK ||
+        !got_raw) {
+      continue;
+    }
+    const size_t n_raw = got_raw / sizeof(int16_t) / ratio * ratio;
+    if (!mic_muted && ratio == RATIO) listen_for_claims(raw, n_raw);
     decimate(raw, n_raw, buf);
-    const size_t n = n_raw / RATIO;
+    const size_t n = n_raw / ratio;
     const size_t got = n * sizeof(int16_t);
     const bool speech = !mic_muted && is_speech(buf, n);
     if (!listen_on && !mic_muted) wakeword::feed(buf, n);  // between sessions, the wake word listens
@@ -525,7 +544,8 @@ StreamBufferHandle_t psram_stream(size_t bytes) {
 
 }  // namespace
 
-bool begin() {
+bool begin(bool ultrasonic) {
+  ratio = ultrasonic ? RATIO : 1;
   pinMode(pins::AMP_EN, OUTPUT);
   digitalWrite(pins::AMP_EN, LOW);
   Wire.begin(pins::CODEC_SDA, pins::CODEC_SCL, 100000);
@@ -552,7 +572,7 @@ bool begin() {
   xTaskCreatePinnedToCore(play_task, "audio_out", 4096, nullptr, 5, nullptr, 1);
   xTaskCreatePinnedToCore(capture_task, "audio_in", 4096, nullptr, 5, nullptr, 1);
   ok = true;
-  LOGI(TAG, "ES8311 ready, %d Hz (%d Hz to and from the codec)", SAMPLE_RATE, HW_RATE);
+  LOGI(TAG, "ES8311 ready, %d Hz (%d Hz to and from the codec)", SAMPLE_RATE, SAMPLE_RATE * ratio);
   return true;
 }
 
@@ -697,8 +717,10 @@ void stopSpeech() {
 
 bool speaking() { return speech_on; }
 
+bool ultrasonic() { return ratio == RATIO; }
+
 void claim(int level) {
-  if (!ok) return;
+  if (!ok || ratio != RATIO) return;
   claim_level = constrain(level, 0, CLAIM_LEVELS - 1);
   const Sound s = Sound::Claim;
   xQueueSend(queue, &s, 0);
@@ -711,6 +733,18 @@ HeardClaim lastClaim() {
   const HeardClaim c = heard;
   portEXIT_CRITICAL(&heard_lock);
   return c;
+}
+
+int dbfs(float level) { return static_cast<int>(lroundf(20.0f * log10f(max(level, 1.0f) / 32767.0f))); }
+
+MicStats micStats() {
+  MicStats s;
+  s.average_db = dbfs(stats_count ? stats_sum / stats_count : 0);
+  s.loudest_db = dbfs(stats_max);
+  s.noise_floor = static_cast<int>(noise_floor);
+  stats_sum = stats_max = 0;
+  stats_count = 0;
+  return s;
 }
 
 int recentLevelDb() {

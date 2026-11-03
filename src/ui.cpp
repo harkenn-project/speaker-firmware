@@ -640,8 +640,9 @@ void setMuted(bool m) {
 void showSleepClock(bool on) {
   Lock l;
   if (on && !sleep_panel) {
-    sleep_panel = lv_obj_create(lv_layer_top());  // clickable: a tap only wakes the screen, it doesn't start talking
+    sleep_panel = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(sleep_panel);
+    lv_obj_remove_flag(sleep_panel, LV_OBJ_FLAG_CLICKABLE);  // taps reach the home screen: sleep only changes the look
     lv_obj_set_size(sleep_panel, 240, 240);
     lv_obj_set_style_bg_color(sleep_panel, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(sleep_panel, LV_OPA_COVER, 0);

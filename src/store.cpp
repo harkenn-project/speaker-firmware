@@ -273,6 +273,16 @@ void clearLocalChanges(uint32_t id) {
   if (prefs.isKey("local_chg")) prefs.remove("local_chg");
 }
 
+bool ultrasonic() {
+  Lock l;
+  return !prefs.isKey("audio48k") || prefs.getBool("audio48k", true);
+}
+
+void setUltrasonic(bool on) {
+  Lock l;
+  prefs.putBool("audio48k", on);
+}
+
 void factoryReset() {
   Lock l;
   prefs.clear();

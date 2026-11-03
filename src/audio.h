@@ -15,7 +15,10 @@ enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOf
                              Listen,   // a soft cue when it listens for a reply
                              Claim };  // the inaudible tone (below), at full level whatever the volume
 
-bool begin();  // false if the codec doesn't answer
+// false if the codec doesn't answer. `ultrasonic`: run the codec at 48 kHz, for wake word arbitration (below);
+// otherwise at 16 kHz, and there are no claims.
+bool begin(bool ultrasonic);
+bool ultrasonic();
 
 void setVolume(int percent);  // 0-100; 0 is silent
 int volume();
@@ -77,5 +80,11 @@ struct HeardClaim {
 HeardClaim lastClaim();  // the last claim heard from another speaker
 // The loudest 16 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
 int recentLevelDb();
+// The microphone since the last call: average and loudest level (dBFS, per 16 ms) and the background noise floor
+// (mean absolute amplitude), for the logs.
+struct MicStats {
+  int average_db = 0, loudest_db = 0, noise_floor = 0;
+};
+MicStats micStats();
 
 }  // namespace audio
