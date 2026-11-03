@@ -69,6 +69,14 @@ supported.
     - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).
     - Hold 11 s: factory reset, forgetting Wi-Fi, the token, the server URL and the passwords.
 
+## Screens
+
+[<img src="docs/media/screens.png" alt="Ten round speaker screens: the Kotodama character idle with the clock, listening, answering with text, the weather (Edmonton, -4°, light snow), a question with Yes and No buttons, a timer ring at 4:32, an alarm ringing with Stop and Snooze, a message card, asleep, and the adoption code">](docs/media/screens.png)
+
+A mock-up of what the round screen shows, in the Midnight colour scheme, drawn from the firmware's layouts. The
+weather and the Yes/No question are pictures Harkenn draws for the speaker; the character, layout and colours are
+chosen per speaker or group in Harkenn.
+
 ## Its own web page
 
 For break-glass access when Harkenn can't reach the speaker: `http://<its IP>` on its network, or the hotspot (above)
