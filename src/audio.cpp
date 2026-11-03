@@ -188,6 +188,10 @@ constexpr Note MUTE_ON[] = {{659, 90, 45}, {440, 220, 45}, {0, 0, 0}};
 constexpr Note MUTE_OFF[] = {{440, 90, 45}, {659, 220, 45}, {0, 0, 0}};
 constexpr Note TICK[] = {{1500, 22, 25}, {0, 0, 0}};
 constexpr Note LISTEN[] = {{988, 45, 28}, {1319, 80, 30}, {0, 0, 0}};
+// Timers and alarms: insistent but not harsh, with a gap after each so "stop" and the wake word can be heard.
+constexpr Note TIMER_DONE[] = {{1568, 90, 60}, {0, 60, 0}, {1568, 90, 60}, {0, 60, 0}, {1568, 90, 60}, {0, 0, 0}};
+constexpr Note ALARM[] = {{784, 140, 60}, {988, 140, 60}, {1175, 140, 60}, {1568, 280, 65}, {0, 0, 0}};
+constexpr Note NOTIFY[] = {{1175, 80, 40}, {1568, 160, 42}, {0, 0, 0}};
 constexpr Note SHUTDOWN[] = {{1047, 90, 45}, {784, 90, 45}, {659, 90, 45}, {523, 320, 45}, {0, 0, 0}};
 // A phone-like trill, played every RING_EVERY_MS while a speaker rings (app.cpp).
 constexpr Note RING[] = {{1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55}, {1319, 55, 55}, {1047, 55, 55},
@@ -209,6 +213,9 @@ const Note* notes_for(Sound s) {
     case Sound::Shutdown: return SHUTDOWN;
     case Sound::Listen: return LISTEN;
     case Sound::Claim: return TICK;  // played by render_claim()
+    case Sound::TimerDone: return TIMER_DONE;
+    case Sound::Alarm: return ALARM;
+    case Sound::Notify: return NOTIFY;
   }
   return TICK;
 }
@@ -340,10 +347,13 @@ void play_task(void*) {
         sound_playing = false;
         continue;
       }
-      if (current_volume <= 0) continue;
+      const bool wake_up = s == Sound::TimerDone || s == Sound::Alarm;
+      if (current_volume <= 0 && !wake_up) continue;
       sound_playing = true;
       amp(true);
+      if (wake_up && current_volume < 50) wr(0x32, 0xBF - 50);  // a timer or alarm you'd miss at this volume
       if (!play_clip(s)) render(notes_for(s));
+      if (wake_up) apply_volume();
       sound_playing = false;
       continue;
     }

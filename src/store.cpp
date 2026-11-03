@@ -286,6 +286,10 @@ void setUltrasonic(bool on) {
 void factoryReset() {
   Lock l;
   prefs.clear();
+  Preferences t;  // timers and alarms (timers.cpp) keep their own namespace
+  t.begin("timers", false);
+  t.clear();
+  t.end();
 }
 
 }  // namespace store

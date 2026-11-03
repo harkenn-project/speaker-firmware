@@ -55,8 +55,24 @@ void identify();                       // blink the screen for a few seconds
 void setMuted(bool muted);
 // While the screen sleeps with the "clock" display: only a big clock, over everything else.
 void showSleepClock(bool on);
-// Connected through the relay (away from home): a small icon at the top of every screen.
+// The status row at the top of every screen: remote (through the relay), an alarm set, an unread notification (it
+// pulses when it arrives; a tap on it calls the onNotificationTap callback) and the next timer's time left.
+void setStatusIcons(bool remote, bool alarm, bool notification, const char* timer_text);
 void setRemote(bool on);
+void onNotificationTap(void (*fn)());
+
+// A timer's countdown over everything: a draining ring, the time left and its name, for `seconds` or until a tap.
+void showCountdown(const char* name, time_t due, uint32_t total_s, uint32_t seconds);
+void hideCountdown();
+// Something ringing (a timer, an alarm): a shaking bell in a pulsing halo, what it is, Stop and (with on_snooze)
+// Snooze. A tap anywhere else stops it too. The callbacks run on the UI task with the UI locked.
+void showRinging(const char* title, const char* detail, const char* snooze_text, void (*on_stop)(),
+                 void (*on_snooze)());
+void hideRinging();
+bool ringingShown();
+// A notification card that drops in with a bouncing envelope and rises away after `seconds`; a tap on it calls
+// on_seen (UI task, UI locked).
+void showNotification(const char* title, const char* text, uint32_t seconds, void (*on_seen)());
 
 // "Update available vX" with Install / Dismiss on top of the home screen, until hidden. The buttons call the
 // callbacks (on the UI task, UI locked) and hide the prompt.

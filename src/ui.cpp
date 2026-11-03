@@ -658,18 +658,291 @@ void showSleepClock(bool on) {
   }
 }
 
+namespace {
+
+// The status row, at the top of every screen (on the top layer): remote, alarm, notification, and the next timer's
+// time left. Each shows only when it applies.
+lv_obj_t* status_row = nullptr;
+lv_obj_t* status_remote = nullptr;
+lv_obj_t* status_alarm = nullptr;
+lv_obj_t* status_note = nullptr;
+lv_obj_t* status_timer = nullptr;
+void (*on_note_tap)() = nullptr;
+
+lv_obj_t* status_icon(const char* symbol, uint32_t rgb) {
+  lv_obj_t* l = lv_label_create(status_row);
+  lv_label_set_text(l, symbol);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(l, color(rgb), 0);
+  lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+  return l;
+}
+
+void make_status_row() {
+  if (status_row) return;
+  status_row = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(status_row);
+  lv_obj_set_size(status_row, 140, 22);
+  lv_obj_align(status_row, LV_ALIGN_TOP_MID, 0, 8);
+  lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(status_row, 8, 0);
+  lv_obj_remove_flag(status_row, LV_OBJ_FLAG_CLICKABLE);
+  status_remote = status_icon(LV_SYMBOL_SHUFFLE, 0xffb547);
+  status_alarm = status_icon(LV_SYMBOL_BELL, 0xe8ecff);
+  status_note = status_icon(LV_SYMBOL_ENVELOPE, 0x7aa2ff);
+  lv_obj_add_flag(status_note, LV_OBJ_FLAG_CLICKABLE);  // reopens the notification
+  lv_obj_set_ext_click_area(status_note, 14);
+  lv_obj_add_event_cb(status_note, [](lv_event_t*) { if (on_note_tap) on_note_tap(); }, LV_EVENT_CLICKED, nullptr);
+  status_timer = status_icon("", 0xe8ecff);
+}
+
+void show_if(lv_obj_t* o, bool on) {
+  if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Animation helpers: they only move or fade objects, so nothing needs an extra drawing buffer.
+void anim_y(void* o, int32_t v) { lv_obj_set_y(static_cast<lv_obj_t*>(o), v); }
+void anim_x(void* o, int32_t v) { lv_obj_set_x(static_cast<lv_obj_t*>(o), v); }
+void anim_opa(void* o, int32_t v) { lv_obj_set_style_opa(static_cast<lv_obj_t*>(o), v, 0); }
+void anim_bg_opa(void* o, int32_t v) { lv_obj_set_style_bg_opa(static_cast<lv_obj_t*>(o), v, 0); }
+void anim_size(void* o, int32_t v) {
+  lv_obj_set_size(static_cast<lv_obj_t*>(o), v, v);
+  lv_obj_center(static_cast<lv_obj_t*>(o));
+}
+
+void animate(lv_obj_t* o, lv_anim_exec_xcb_t fn, int32_t from, int32_t to, uint32_t ms, int repeat = 0,
+             bool back = false, lv_anim_path_cb_t path = lv_anim_path_ease_in_out, uint32_t delay = 0) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, o);
+  lv_anim_set_exec_cb(&a, fn);
+  lv_anim_set_values(&a, from, to);
+  lv_anim_set_duration(&a, ms);
+  lv_anim_set_delay(&a, delay);
+  lv_anim_set_path_cb(&a, path);
+  if (back) lv_anim_set_playback_duration(&a, ms);
+  if (repeat) lv_anim_set_repeat_count(&a, repeat < 0 ? LV_ANIM_REPEAT_INFINITE : repeat);
+  lv_anim_start(&a);
+}
+
+lv_obj_t* full_panel() {  // over everything, under the status row
+  lv_obj_t* p = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(p);
+  lv_obj_set_size(p, 240, 240);
+  lv_obj_set_style_bg_color(p, color(theme.background), 0);
+  lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+  if (status_row) lv_obj_move_foreground(status_row);
+  return p;
+}
+
+lv_obj_t* round_button(lv_obj_t* parent, const char* text, uint32_t bg, uint32_t fg, int x, int y, int w,
+                       lv_event_cb_t cb) {
+  lv_obj_t* b = lv_button_create(parent);
+  lv_obj_set_size(b, w, 40);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_style_bg_color(b, color(bg), 0);
+  lv_obj_set_style_radius(b, 20, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_color(l, color(fg), 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+  return b;
+}
+
+// The countdown: a ring that drains as the timer runs, the time left and the label. A tap hides it.
+lv_obj_t* countdown_panel = nullptr;
+lv_obj_t* countdown_arc = nullptr;
+lv_obj_t* countdown_time = nullptr;
+lv_timer_t* countdown_timer = nullptr;
+time_t countdown_due = 0;
+uint32_t countdown_total = 1, countdown_hide_at = 0;
+
+void format_left(char* out, size_t n, long left) {
+  if (left >= 3600) snprintf(out, n, "%ld:%02ld:%02ld", left / 3600, left / 60 % 60, left % 60);
+  else snprintf(out, n, "%ld:%02ld", left / 60, left % 60);
+}
+
+void hide_countdown_locked() {
+  if (countdown_timer) lv_timer_delete(countdown_timer);
+  countdown_timer = nullptr;
+  if (countdown_panel) lv_obj_delete_async(countdown_panel);
+  countdown_panel = countdown_arc = countdown_time = nullptr;
+}
+
+void tick_countdown(lv_timer_t*) {
+  if (!countdown_panel) return;
+  const long left = max<long>(0, static_cast<long>(countdown_due - time(nullptr)));
+  char buf[16];
+  format_left(buf, sizeof(buf), left);
+  lv_label_set_text(countdown_time, buf);
+  lv_arc_set_value(countdown_arc, static_cast<int32_t>(1000L * left / max<uint32_t>(1, countdown_total)));
+  if (left <= 10) lv_obj_set_style_text_color(countdown_time, color(left % 2 ? theme.accent : theme.text), 0);
+  if (!left || static_cast<int32_t>(millis() - countdown_hide_at) >= 0) hide_countdown_locked();
+}
+
+// Ringing: a bell that shakes inside a pulsing halo, what's ringing, and Stop / Snooze. A tap anywhere else stops it.
+lv_obj_t* ringing_panel = nullptr;
+void (*ringing_stop)() = nullptr;
+void (*ringing_snooze)() = nullptr;
+
+void close_ringing(void (*fn)()) {
+  if (ringing_panel) lv_obj_delete_async(ringing_panel);  // we may be inside one of its handlers
+  ringing_panel = nullptr;
+  if (fn) fn();
+}
+
+// A notification: a card that drops in with a bouncing envelope, then rises away; the envelope stays in the status
+// row until someone looks at it.
+lv_obj_t* note_card = nullptr;
+lv_timer_t* note_timer = nullptr;
+void (*note_seen)() = nullptr;
+uint32_t note_hide_at = 0, note_gone_at = 0;  // when it starts rising away, and when it's gone
+
+void close_note() {
+  if (note_timer) lv_timer_delete(note_timer);
+  note_timer = nullptr;
+  if (note_card) lv_obj_delete_async(note_card);
+  note_card = nullptr;
+}
+
+}  // namespace
+
+void setStatusIcons(bool remote, bool alarm, bool note, const char* timer_text) {
+  Lock l;
+  make_status_row();
+  show_if(status_remote, remote);
+  show_if(status_alarm, alarm);
+  const bool was_note = !lv_obj_has_flag(status_note, LV_OBJ_FLAG_HIDDEN);
+  show_if(status_note, note);
+  if (note && !was_note) animate(status_note, anim_opa, LV_OPA_20, LV_OPA_COVER, 450, 3, true);  // it arrived
+  const bool timer = timer_text && timer_text[0];
+  if (timer) lv_label_set_text(status_timer, (String(LV_SYMBOL_LOOP " ") + timer_text).c_str());
+  show_if(status_timer, timer);
+}
+
+void onNotificationTap(void (*fn)()) {
+  Lock l;
+  on_note_tap = fn;
+}
+
 void setRemote(bool on) {
   Lock l;
-  static lv_obj_t* icon = nullptr;  // on the top layer: it stays over every screen
-  if (!icon) {
-    icon = lv_label_create(lv_layer_top());
-    lv_label_set_text(icon, LV_SYMBOL_SHUFFLE);
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(icon, color(0xffb547), 0);
-    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
+  make_status_row();
+  show_if(status_remote, on);
+}
+
+void showCountdown(const char* name, time_t due, uint32_t total_s, uint32_t seconds) {
+  Lock l;
+  hide_countdown_locked();
+  countdown_due = due;
+  countdown_total = max<uint32_t>(1, total_s);
+  countdown_hide_at = millis() + seconds * 1000;
+  countdown_panel = full_panel();
+  lv_obj_add_flag(countdown_panel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(countdown_panel, [](lv_event_t*) { hide_countdown_locked(); }, LV_EVENT_CLICKED, nullptr);
+  countdown_arc = lv_arc_create(countdown_panel);
+  lv_obj_set_size(countdown_arc, 220, 220);
+  lv_obj_center(countdown_arc);
+  lv_arc_set_rotation(countdown_arc, 270);  // from the top, clockwise
+  lv_arc_set_bg_angles(countdown_arc, 0, 360);
+  lv_arc_set_range(countdown_arc, 0, 1000);
+  lv_obj_remove_flag(countdown_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(countdown_arc, 12, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(countdown_arc, 12, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(countdown_arc, color(theme.surface), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(countdown_arc, color(theme.primary), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(countdown_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(countdown_arc, 0, LV_PART_KNOB);
+  countdown_time = label(countdown_panel, "", &lv_font_montserrat_48, theme.text, 20, 86, 200, 60);
+  label(countdown_panel, name && name[0] ? name : "Timer", &lv_font_montserrat_18, theme.muted, 40, 148, 160, 24);
+  animate(countdown_arc, anim_opa, LV_OPA_TRANSP, LV_OPA_COVER, 400);  // fades in
+  countdown_timer = lv_timer_create(tick_countdown, 250, nullptr);
+  tick_countdown(nullptr);
+}
+
+void hideCountdown() {
+  Lock l;
+  hide_countdown_locked();
+}
+
+void showRinging(const char* title, const char* detail, const char* snooze_text, void (*on_stop)(),
+                 void (*on_snooze)()) {
+  Lock l;
+  if (ringing_panel) lv_obj_delete(ringing_panel);
+  ringing_stop = on_stop;
+  ringing_snooze = on_snooze;
+  ringing_panel = full_panel();
+  lv_obj_add_flag(ringing_panel, LV_OBJ_FLAG_CLICKABLE);  // a tap anywhere else stops it
+  lv_obj_add_event_cb(ringing_panel, [](lv_event_t*) { close_ringing(ringing_stop); }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* halo = lv_obj_create(ringing_panel);  // a pulsing glow behind the bell
+  lv_obj_remove_style_all(halo);
+  lv_obj_set_style_radius(halo, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(halo, color(theme.accent), 0);
+  lv_obj_set_style_bg_opa(halo, LV_OPA_30, 0);
+  lv_obj_remove_flag(halo, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(halo, 80, 80);
+  lv_obj_align(halo, LV_ALIGN_TOP_MID, 0, 34);
+  animate(halo, anim_bg_opa, LV_OPA_10, LV_OPA_50, 500, -1, true);
+  lv_obj_t* bell = label(ringing_panel, LV_SYMBOL_BELL, &lv_font_montserrat_48, theme.text, 90, 44, 60, 60);
+  animate(bell, anim_x, 84, 96, 90, -1, true, lv_anim_path_linear);  // it shakes
+  label(ringing_panel, title, &lv_font_montserrat_24, theme.text, 20, 118, 200, 30);
+  if (detail && detail[0]) label(ringing_panel, detail, &lv_font_montserrat_14, theme.muted, 30, 148, 180, 20);
+  round_button(ringing_panel, "Stop", theme.primary, theme.background, on_snooze ? 34 : 70, 176,
+               on_snooze ? 80 : 100, [](lv_event_t*) { close_ringing(ringing_stop); });
+  if (on_snooze) {
+    round_button(ringing_panel, snooze_text, theme.surface, theme.text, 126, 176, 80,
+                 [](lv_event_t*) { close_ringing(ringing_snooze); });
   }
-  if (on) lv_obj_remove_flag(icon, LV_OBJ_FLAG_HIDDEN);
-  else lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
+}
+
+void hideRinging() {
+  Lock l;
+  if (ringing_panel) lv_obj_delete(ringing_panel);
+  ringing_panel = nullptr;
+}
+
+bool ringingShown() { return ringing_panel != nullptr; }
+
+void showNotification(const char* title, const char* text, uint32_t seconds, void (*on_seen)()) {
+  Lock l;
+  close_note();
+  note_seen = on_seen;
+  note_card = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(note_card, 200, 150);
+  lv_obj_set_style_bg_color(note_card, color(theme.surface), 0);
+  lv_obj_set_style_bg_opa(note_card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(note_card, color(theme.primary), 0);
+  lv_obj_set_style_border_width(note_card, 2, 0);
+  lv_obj_set_style_radius(note_card, 24, 0);
+  lv_obj_set_style_pad_all(note_card, 0, 0);
+  lv_obj_remove_flag(note_card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_x(note_card, 20);
+  if (status_row) lv_obj_move_foreground(status_row);
+  lv_obj_add_event_cb(note_card, [](lv_event_t*) {
+    close_note();
+    if (note_seen) note_seen();
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* icon = label(note_card, LV_SYMBOL_ENVELOPE, &lv_font_montserrat_28, theme.primary, 0, 8, 196, 34);
+  label(note_card, title && title[0] ? title : "Notification", &lv_font_montserrat_18, theme.text, 10, 44, 176, 24);
+  label(note_card, text, &lv_font_montserrat_14, theme.muted, 12, 70, 172, 66, 4);
+  animate(note_card, anim_y, -160, 44, 520, 0, false, lv_anim_path_overshoot);  // drops in
+  animate(icon, anim_y, 4, 12, 260, 4, true, lv_anim_path_ease_out, 520);       // and the envelope bounces
+  note_hide_at = millis() + max<uint32_t>(3, seconds) * 1000;
+  note_gone_at = 0;
+  note_timer = lv_timer_create([](lv_timer_t*) {
+    if (!note_gone_at && static_cast<int32_t>(millis() - note_hide_at) >= 0) {
+      animate(note_card, anim_y, lv_obj_get_y(note_card), -170, 420, 0, false, lv_anim_path_ease_in);  // rises away
+      note_gone_at = millis() + 450;
+    } else if (note_gone_at && static_cast<int32_t>(millis() - note_gone_at) >= 0) {
+      close_note();  // deletes this timer: LVGL allows that from its own callback
+    }
+  }, 100, nullptr);
 }
 
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)()) {

@@ -75,17 +75,19 @@ struct Model {
   int window = 1;
   uint8_t recent[16] = {};
   int recent_at = 0;
+  uint32_t quiet_until = 0;  // no detection before this (warming up, or just after one)
 };
 
-SemaphoreHandle_t lock = nullptr;  // guards `model` against load/unload while the task runs it
+// Two models on the same features: the wake word, and "stop" while something rings (timers, alarms).
+SemaphoreHandle_t lock = nullptr;  // guards the models against load/unload while the task runs them
 StreamBufferHandle_t samples = nullptr;
 Resolver resolver;
 Model* model = nullptr;
+Model* stop_model = nullptr;
 FrontendState frontend;
 bool frontend_ok = false;
-volatile bool listening = false;
-volatile bool detected = false;
-uint32_t quiet_until = 0;
+volatile bool listening = false, stop_listening = false;
+volatile bool detected = false, stop_detected = false;
 Stats stats_now;
 uint64_t infer_us_total = 0;
 
@@ -97,60 +99,69 @@ void free_model(Model* m) {
   delete m;
 }
 
+void reset_model(Model* m) {
+  if (!m) return;
+  m->filled = 0;
+  memset(m->recent, 0, sizeof(m->recent));
+  m->interpreter->Reset();
+  m->quiet_until = millis() + WARM_UP_MS;
+}
+
 // Forgets everything heard so far. The streaming model keeps the last second or two of audio in its own variables,
 // so without resetting those it would still "hear" the wake word that started the last conversation as soon as
 // listening resumes, and wake again.
 void reset_stream() {
   if (frontend_ok) FrontendReset(&frontend);
-  if (model) {
-    model->filled = 0;
-    memset(model->recent, 0, sizeof(model->recent));
-    model->interpreter->Reset();
-  }
-  quiet_until = millis() + WARM_UP_MS;
+  reset_model(model);
+  reset_model(stop_model);
   detected = false;
+  stop_detected = false;
 }
 
-// One feature step into the model; runs it when a full stride has accumulated.
-void step(const int8_t* features) {
-  Model& m = *model;
+// One feature step into a model; runs it when a full stride has accumulated. True on a detection.
+bool step(Model& m, const int8_t* features, bool count_stats) {
   TfLiteTensor* input = m.interpreter->input(0);
   memcpy(input->data.int8 + FEATURES * m.filled, features, FEATURES);
-  if (++m.filled < m.stride) return;
+  if (++m.filled < m.stride) return false;
   m.filled = 0;
   const int64_t t0 = esp_timer_get_time();
   if (m.interpreter->Invoke() != kTfLiteOk) {
     LOGW(TAG, "inference failed");
-    return;
+    return false;
   }
-  infer_us_total += esp_timer_get_time() - t0;
-  stats_now.inferences++;
   const uint8_t p = m.interpreter->output(0)->data.uint8[0];
-  if (p / 255.0f > stats_now.max_probability) stats_now.max_probability = p / 255.0f;
+  if (count_stats) {
+    infer_us_total += esp_timer_get_time() - t0;
+    stats_now.inferences++;
+    if (p / 255.0f > stats_now.max_probability) stats_now.max_probability = p / 255.0f;
+  }
   m.recent[m.recent_at] = p;
   m.recent_at = (m.recent_at + 1) % m.window;
   uint32_t sum = 0;
   for (int i = 0; i < m.window; i++) sum += m.recent[i];
-  if (sum >= static_cast<uint32_t>(m.cutoff) * m.window && static_cast<int32_t>(millis() - quiet_until) >= 0) {
-    LOGI(TAG, "wake word (average %u%%)", static_cast<unsigned>(sum * 100 / (255 * m.window)));
-    detected = true;
-    quiet_until = millis() + REFRACTORY_MS;
+  if (sum >= static_cast<uint32_t>(m.cutoff) * m.window && static_cast<int32_t>(millis() - m.quiet_until) >= 0) {
+    LOGI(TAG, "%s (average %u%%)", count_stats ? "wake word" : "stop", static_cast<unsigned>(sum * 100 / (255 * m.window)));
+    m.quiet_until = millis() + REFRACTORY_MS;
     memset(m.recent, 0, sizeof(m.recent));
+    return true;
   }
+  return false;
 }
+
+bool any_listening() { return (listening && model) || (stop_listening && stop_model); }
 
 void task(void*) {
   static int16_t buf[160];  // 10 ms
   bool was_listening = false;
   for (;;) {
     const size_t n = xStreamBufferReceive(samples, buf, sizeof(buf), pdMS_TO_TICKS(100));
-    const bool on = listening;
+    const bool on = any_listening();
     const bool resumed = on && !was_listening;
     was_listening = on;
     if (!resumed && (!n || !on)) continue;
     xSemaphoreTake(lock, portMAX_DELAY);
     if (resumed) reset_stream();  // a fresh start after a pause: no stale audio
-    if (model && frontend_ok) {
+    if (frontend_ok) {
       const int16_t* p = buf;
       size_t left = n / sizeof(int16_t);
       while (left) {
@@ -161,13 +172,70 @@ void task(void*) {
         if (out.size == FEATURES) {
           int8_t features[FEATURES];
           for (int i = 0; i < FEATURES; i++) features[i] = quantize(out.values[i]);
-          step(features);
+          if (listening && model && step(*model, features, true)) detected = true;
+          if (stop_listening && stop_model && step(*stop_model, features, false)) stop_detected = true;
         }
         if (!read) break;
       }
     }
     xSemaphoreGive(lock);
   }
+}
+
+// A model from a .tflite file, ready to run; null (logged) if it can't be.
+Model* build(const uint8_t* data, size_t size, float cutoff, int window, size_t arena) {
+  auto* m = new Model();
+  m->data = static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM));
+  arena += 8 * 1024;  // headroom for this TFLM build
+  // PSRAM, not internal RAM: HTTPS needs the internal RAM (each TLS connection takes tens of KB), and with the arena
+  // there no secure connection could be made at all. The model runs fast enough from PSRAM.
+  m->arena = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM));
+  if (!m->data || !m->arena) {
+    LOGE(TAG, "out of memory for the model");
+    free_model(m);
+    return nullptr;
+  }
+  memcpy(m->data, data, size);
+  const tflite::Model* tf = tflite::GetModel(m->data);
+  if (tf->version() != TFLITE_SCHEMA_VERSION) {
+    LOGE(TAG, "model has schema %lu, not %d", tf->version(), TFLITE_SCHEMA_VERSION);
+    free_model(m);
+    return nullptr;
+  }
+  m->allocator = tflite::MicroAllocator::Create(m->arena, arena);
+  m->variables = tflite::MicroResourceVariables::Create(m->allocator, RESOURCE_VARIABLES);
+  m->interpreter = new tflite::MicroInterpreter(tf, resolver, m->allocator, m->variables);
+  if (m->interpreter->AllocateTensors() != kTfLiteOk) {
+    LOGE(TAG, "model doesn't fit in %u bytes", static_cast<unsigned>(arena));
+    free_model(m);
+    return nullptr;
+  }
+  TfLiteTensor* in = m->interpreter->input(0);
+  TfLiteTensor* out = m->interpreter->output(0);
+  if (in->type != kTfLiteInt8 || in->dims->size != 3 || in->dims->data[2] != FEATURES || out->type != kTfLiteUInt8) {
+    LOGE(TAG, "not a streaming wake word model (input %d dims, type %d; output type %d)", in->dims->size, in->type,
+         out->type);
+    free_model(m);
+    return nullptr;
+  }
+  m->stride = in->dims->data[1];
+  m->cutoff = static_cast<uint8_t>(constrain(cutoff, 0.0f, 1.0f) * 255.0f);
+  m->window = constrain(window, 1, 16);
+  LOGI(TAG, "model loaded: %u bytes, stride %d, cutoff %.2f over %d, arena %u used of %u; internal RAM free %u "
+       "(largest block %u)", static_cast<unsigned>(size), m->stride, cutoff, m->window,
+       static_cast<unsigned>(m->interpreter->arena_used_bytes()), static_cast<unsigned>(arena),
+       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+  return m;
+}
+
+void swap_in(Model** slot, Model* m) {
+  xSemaphoreTake(lock, portMAX_DELAY);
+  Model* old = *slot;
+  *slot = m;
+  reset_model(m);
+  xSemaphoreGive(lock);
+  free_model(old);
 }
 
 }  // namespace
@@ -194,77 +262,45 @@ bool begin() {
 }
 
 bool load(const uint8_t* data, size_t size, float cutoff, int window, size_t arena) {
-  auto* m = new Model();
-  m->data = static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM));
-  arena += 8 * 1024;  // headroom for this TFLM build
-  // PSRAM, not internal RAM: HTTPS needs the internal RAM (each TLS connection takes tens of KB), and with the arena
-  // there no secure connection could be made at all. The model runs fast enough from PSRAM.
-  m->arena = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM));
-  if (!m->data || !m->arena) {
-    LOGE(TAG, "out of memory for the wake word model");
-    free_model(m);
-    return false;
-  }
-  memcpy(m->data, data, size);
-  const tflite::Model* tf = tflite::GetModel(m->data);
-  if (tf->version() != TFLITE_SCHEMA_VERSION) {
-    LOGE(TAG, "wake word model has schema %lu, not %d", tf->version(), TFLITE_SCHEMA_VERSION);
-    free_model(m);
-    return false;
-  }
-  m->allocator = tflite::MicroAllocator::Create(m->arena, arena);
-  m->variables = tflite::MicroResourceVariables::Create(m->allocator, RESOURCE_VARIABLES);
-  m->interpreter = new tflite::MicroInterpreter(tf, resolver, m->allocator, m->variables);
-  if (m->interpreter->AllocateTensors() != kTfLiteOk) {
-    LOGE(TAG, "wake word model doesn't fit in %u bytes", static_cast<unsigned>(arena));
-    free_model(m);
-    return false;
-  }
-  TfLiteTensor* in = m->interpreter->input(0);
-  TfLiteTensor* out = m->interpreter->output(0);
-  if (in->type != kTfLiteInt8 || in->dims->size != 3 || in->dims->data[2] != FEATURES || out->type != kTfLiteUInt8) {
-    LOGE(TAG, "not a streaming wake word model (input %d dims, type %d; output type %d)", in->dims->size, in->type,
-         out->type);
-    free_model(m);
-    return false;
-  }
-  m->stride = in->dims->data[1];
-  m->cutoff = static_cast<uint8_t>(constrain(cutoff, 0.0f, 1.0f) * 255.0f);
-  m->window = constrain(window, 1, 16);
-  xSemaphoreTake(lock, portMAX_DELAY);
-  Model* old = model;
-  model = m;
-  reset_stream();
-  xSemaphoreGive(lock);
-  free_model(old);
-  LOGI(TAG, "wake word model loaded: %u bytes, stride %d, cutoff %.2f over %d, arena %u used of %u; internal RAM "
-       "free %u (largest block %u)", static_cast<unsigned>(size), m->stride, cutoff, m->window,
-       static_cast<unsigned>(m->interpreter->arena_used_bytes()), static_cast<unsigned>(arena),
-       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+  Model* m = build(data, size, cutoff, window, arena);
+  if (!m) return false;
+  swap_in(&model, m);
   return true;
 }
 
-void unload() {
-  xSemaphoreTake(lock, portMAX_DELAY);
-  Model* old = model;
-  model = nullptr;
-  xSemaphoreGive(lock);
-  free_model(old);
-}
+void unload() { swap_in(&model, nullptr); }
 
 bool loaded() { return model != nullptr; }
 
+bool loadStop(const uint8_t* data, size_t size, float cutoff, int window, size_t arena) {
+  Model* m = build(data, size, cutoff, window, arena);
+  if (!m) return false;
+  swap_in(&stop_model, m);
+  return true;
+}
+
+void unloadStop() { swap_in(&stop_model, nullptr); }
+
+bool stopLoaded() { return stop_model != nullptr; }
+
 void feed(const int16_t* pcm, size_t count) {
-  if (!samples || !listening || !model) return;
+  if (!samples || !any_listening()) return;
   xStreamBufferSend(samples, pcm, count * sizeof(int16_t), 0);
 }
 
 void setListening(bool on) { listening = on; }
 
+void setStopListening(bool on) { stop_listening = on; }
+
 bool takeDetection() {
   if (!detected) return false;
   detected = false;
+  return true;
+}
+
+bool takeStop() {
+  if (!stop_detected) return false;
+  stop_detected = false;
   return true;
 }
 

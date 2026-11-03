@@ -17,6 +17,13 @@ bool load(const uint8_t* model, size_t size, float cutoff, int window, size_t ar
 void unload();
 bool loaded();
 
+// "Stop": a second model on the same features, listening only while something rings (timers, alarms).
+bool loadStop(const uint8_t* model, size_t size, float cutoff, int window, size_t arena);
+void unloadStop();
+bool stopLoaded();
+void setStopListening(bool on);
+bool takeStop();  // true once per "stop" heard
+
 void feed(const int16_t* samples, size_t count);  // from the audio task; never blocks, drops samples when behind
 void setListening(bool on);  // pause (false) while the speaker is busy, so it doesn't wake itself up
 bool takeDetection();        // true once per detection

@@ -13,7 +13,9 @@ constexpr int HW_RATE = 48000;      // what the codec runs at
 // a clip from Harkenn if one is stored (an empty clip is silence), else synthesized on the speaker like the rest.
 enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring, Shutdown,
                              Listen,   // a soft cue when it listens for a reply
-                             Claim };  // the inaudible tone (below), at full level whatever the volume
+                             Claim,    // the inaudible tone (below), at full level whatever the volume
+                             TimerDone, Alarm,  // at least at a level you'd hear, whatever the volume
+                             Notify };
 
 // false if the codec doesn't answer. `ultrasonic`: run the codec at 48 kHz, for wake word arbitration (below);
 // otherwise at 16 kHz, and there are no claims.

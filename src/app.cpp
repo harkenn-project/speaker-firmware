@@ -28,6 +28,7 @@
 #include "logbuf.h"
 #include "relay.h"
 #include "store.h"
+#include "timers.h"
 #include "ui.h"
 #include "wakeword.h"
 #include "web.h"
@@ -737,6 +738,33 @@ bool apply_wake_word(JsonVariantConst w) {
   return ok;
 }
 
+// "Stop" (config "stop_word"): a second model, listening only while a timer or alarm rings. Kept in flash too.
+String stop_model_url;
+
+bool apply_stop_word(JsonVariantConst w) {
+  const String url = w["url"] | "";
+  if (w.isNull() || !url.length()) {
+    wakeword::unloadStop();
+    stop_model_url = "";
+    return true;
+  }
+  if (url == stop_model_url && wakeword::stopLoaded()) return true;
+  size_t size = 0;
+  uint8_t* data = nullptr;
+  std::shared_ptr<ui::Blob> blob;
+  if (audio::soundSource("stopword") == url) data = audio::readSound("stopword", &size);
+  if (!data) {
+    blob = download(url);
+    if (!blob) return false;
+    audio::storeSound("stopword", url, blob->data, blob->size);
+  }
+  const bool ok = wakeword::loadStop(data ? data : blob->data, data ? size : blob->size, w["cutoff"] | 0.5f,
+                                     w["window"] | 5, w["arena"] | 21000);
+  free(data);
+  if (ok) stop_model_url = url;
+  return ok;
+}
+
 bool has_ssid(JsonVariantConst list, const String& ssid) {
   for (JsonVariantConst v : list.as<JsonArrayConst>()) {
     if ((v.is<JsonObjectConst>() ? String(v["ssid"] | "") : String(v | "")) == ssid) return true;
@@ -812,6 +840,7 @@ void apply_config(JsonDocument& doc) {
 
   bool complete = apply_sounds(doc["sounds"]);
   complete &= apply_wake_word(doc["wake_word"]);
+  complete &= apply_stop_word(doc["stop_word"]);
 
   // Character animations: download what changed, reuse the rest.
   ui::CharacterSet set;
@@ -1341,6 +1370,240 @@ void update_screen() {
   else board::markActivity();  // the display stays on while it's shown
 }
 
+// Timers and alarms (timers.cpp) ring here, and notifications from Harkenn show here; both keep an icon in the
+// status row until they're dealt with. Ringing stops with a tap, the wake word, "stop" (its own small model,
+// listening only now), Harkenn, or after TIMER_RING_MS / ALARM_RING_MS.
+constexpr uint32_t TIMER_RING_MS = 5 * 60000;
+constexpr uint32_t ALARM_RING_MS = 15 * 60000;
+constexpr uint32_t RING_SOUND_EVERY_MS = 2500;  // the gaps let "stop" and the wake word be heard
+constexpr uint32_t TIMER_SNOOZE_MIN = 1, ALARM_SNOOZE_MIN = 9;
+constexpr size_t MAX_NOTES = 5;
+
+struct TimerRing {
+  bool on = false;
+  timers::Item item;
+  uint32_t started = 0, next_sound = 0;
+};
+TimerRing timer_ring;
+volatile bool ring_stop_tapped = false, ring_snooze_tapped = false;
+uint32_t timers_sent = UINT32_MAX;  // the timers::version() Harkenn last heard about
+struct Note {
+  String title, text;
+};
+std::vector<Note> notes;
+volatile bool note_reopen = false, note_seen = false;
+
+bool timer_ringing() { return timer_ring.on; }
+
+void send_timers() {
+  timers_sent = timers::version();
+  if (!ws_connected) return;
+  JsonDocument doc;
+  doc["type"] = "timers";
+  timers::toJson(doc["items"].to<JsonArray>());
+  if (timer_ring.on) doc["ringing"] = timer_ring.item.id;
+  send_json(doc);
+}
+
+// For Harkenn's log, and so the assistant knows (rang, stopped, snoozed, missed).
+void timer_event(const char* name, const timers::Item& item, const char* how) {
+  if (!ws_connected) return;
+  JsonDocument doc;
+  doc["type"] = "event";
+  doc["name"] = name;
+  JsonObject d = doc["data"].to<JsonObject>();
+  d["kind"] = item.alarm ? "alarm" : "timer";
+  d["id"] = item.id;
+  d["label"] = item.label;
+  if (how && how[0]) d["how"] = how;
+  send_json(doc);
+}
+
+String left_text(long left) {
+  char buf[16];
+  if (left < 0) left = 0;
+  if (left >= 3600) snprintf(buf, sizeof(buf), "%ld:%02ld:%02ld", left / 3600, left / 60 % 60, left % 60);
+  else snprintf(buf, sizeof(buf), "%ld:%02ld", left / 60, left % 60);
+  return buf;
+}
+
+void start_timer_ring(const timers::Item& it) {
+  timer_ring = TimerRing{true, it, millis(), millis()};
+  board::markActivity();
+  ui::hideCountdown();
+  const String title = it.label.length() ? it.label : String(it.alarm ? "Alarm" : "Timer");
+  const String detail = it.alarm ? timers::describe(it) : String(it.label.length() ? "Timer done" : "Time's up");
+  ui::showRinging(title.c_str(), detail.c_str(), it.alarm ? "Snooze" : "+1 min", [] { ring_stop_tapped = true; },
+                  [] { ring_snooze_tapped = true; });
+  LOGI(TAG, "%s \"%s\" ringing", it.alarm ? "alarm" : "timer", it.label.c_str());
+  timer_event("timer_ringing", it, "");
+  timers_sent = UINT32_MAX;
+}
+
+void stop_timer_ring(const char* event, const char* how, bool snooze) {
+  if (!timer_ring.on) return;
+  const timers::Item it = timer_ring.item;
+  timer_ring.on = false;
+  ui::hideRinging();
+  if (snooze) timers::snooze(it, it.alarm ? ALARM_SNOOZE_MIN : TIMER_SNOOZE_MIN);
+  LOGI(TAG, "%s \"%s\": %s (%s)", it.alarm ? "alarm" : "timer", it.label.c_str(), event, how);
+  timer_event(event, it, how);
+  timers_sent = UINT32_MAX;
+}
+
+void refresh_status_row() {
+  bool alarm = false;
+  String timer;
+  const time_t now = time(nullptr);
+  for (const auto& i : timers::list()) {  // soonest first
+    if (i.alarm) alarm = true;
+    else if (!timer.length()) timer = left_text(static_cast<long>(i.due - now));
+  }
+  ui::setStatusIcons(via_relay, alarm, !notes.empty(), timer.c_str());
+}
+
+void clear_notifications(bool tell) {
+  if (notes.empty()) return;
+  notes.clear();
+  if (tell && ws_connected) send_text("{\"type\":\"notifications_seen\"}");
+}
+
+void handle_notify(JsonDocument& doc) {
+  Note n{doc["title"] | "", doc["text"] | ""};
+  if (!n.text.length() && !n.title.length()) return;
+  notes.push_back(n);
+  if (notes.size() > MAX_NOTES) notes.erase(notes.begin());
+  if (doc["quiet"] | false) return;  // the icon only (e.g. sent again after a restart)
+  board::markActivity();
+  if (voice == Voice::Off && !timer_ring.on) audio::play(audio::Sound::Notify);
+  ui::showNotification(n.title.c_str(), n.text.c_str(), doc["seconds"] | 12, [] { note_seen = true; });
+}
+
+// Days of the week as a mask (bit 0 Sunday): a number, "daily", "weekdays", "weekends", or names ("mon,wed").
+uint8_t parse_days(JsonVariantConst v) {
+  if (v.is<int>()) return v.as<int>() & 0x7f;
+  String s;
+  if (v.is<JsonArrayConst>()) {
+    for (JsonVariantConst d : v.as<JsonArrayConst>()) s += String(d | "") + ",";
+  } else {
+    s = v | "";
+  }
+  s.toLowerCase();
+  if (s.indexOf("daily") >= 0 || s.indexOf("every") >= 0) return 0x7f;
+  if (s.indexOf("weekday") >= 0) return 0x3e;
+  if (s.indexOf("weekend") >= 0) return 0x41;
+  const char* names[] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
+  uint8_t mask = 0;
+  for (int d = 0; d < 7; d++) {
+    if (s.indexOf(names[d]) >= 0) mask |= 1 << d;
+  }
+  return mask;
+}
+
+void show_timers() {
+  const auto all = timers::list();
+  for (const auto& i : all) {
+    if (!i.alarm) {
+      ui::showCountdown(i.label.c_str(), i.due, i.duration, 20);
+      return;
+    }
+  }
+  String text;
+  for (const auto& i : all) text += (text.length() ? "\n" : "") + (i.label.length() ? i.label + ": " : "") +
+                                    timers::describe(i);
+  ui::showNotification(all.empty() ? "No timers" : "Alarms", text.length() ? text.c_str() : "Nothing is set", 8,
+                       nullptr);
+}
+
+void handle_timer(JsonDocument& doc) {
+  const String action = doc["action"] | "";
+  const String label = doc["label"] | "";
+  if (action == "set") {
+    if (String(doc["kind"] | "timer") == "alarm") {
+      const String t = doc["time"] | "";
+      const int colon = t.indexOf(':');
+      const uint32_t id = colon > 0 ? timers::addAlarm(label, t.substring(0, colon).toInt(),
+                                                       t.substring(colon + 1).toInt(), parse_days(doc["days"]),
+                                                       doc["date"] | "")
+                                    : 0;
+      if (!id) {
+        LOGW(TAG, "couldn't set the alarm for \"%s\"", t.c_str());
+      } else if (doc["show"] | true) {
+        for (const auto& i : timers::list()) {
+          if (i.id == id) ui::showNotification(label.length() ? label.c_str() : "Alarm set", timers::describe(i).c_str(),
+                                                5, nullptr);
+        }
+      }
+    } else {
+      const uint32_t seconds = doc["seconds"] | 0;
+      const uint32_t id = timers::addTimer(label, seconds);
+      if (!id) LOGW(TAG, "couldn't set the timer (%u s)", static_cast<unsigned>(seconds));
+      else if (doc["show"] | true) ui::showCountdown(label.c_str(), time(nullptr) + seconds, seconds, 12);
+    }
+  } else if (action == "cancel") {
+    const String what = doc["what"].is<const char*>() ? String(doc["what"].as<const char*>())
+                                                      : String(doc["what"] | 0);
+    String ringing = timer_ring.item.label;
+    ringing.toLowerCase();
+    String w = what;
+    w.toLowerCase();
+    if (timer_ring.on && (w == "all" || w == ringing || w == String(timer_ring.item.id) ||
+                          (w == "timers" && !timer_ring.item.alarm) || (w == "alarms" && timer_ring.item.alarm))) {
+      stop_timer_ring("timer_stopped", "cancelled", false);
+    }
+    timers::cancelMatching(what);
+    ui::hideCountdown();
+  } else if (action == "show") {
+    board::markActivity();
+    show_timers();
+  } else if (action == "stop") {
+    stop_timer_ring("timer_stopped", "Harkenn", false);
+  }
+}
+
+void update_timers() {
+  if (ring_stop_tapped) {
+    ring_stop_tapped = false;
+    stop_timer_ring("timer_stopped", "a tap", false);
+  }
+  if (ring_snooze_tapped) {
+    ring_snooze_tapped = false;
+    stop_timer_ring("timer_snoozed", "a tap", true);
+  }
+  if (note_seen) {
+    note_seen = false;
+    clear_notifications(true);
+  }
+  if (note_reopen) {
+    note_reopen = false;
+    if (!notes.empty()) {
+      board::markActivity();
+      ui::showNotification(notes.back().title.c_str(), notes.back().text.c_str(), 12, [] { note_seen = true; });
+    }
+  }
+  static uint32_t last_row = 0;
+  if (millis() - last_row >= 1000) {
+    last_row = millis();
+    refresh_status_row();
+  }
+  timers::Item due;
+  if (!timer_ring.on && voice == Voice::Off && !ring_id.length() && timers::takeDue(&due)) start_timer_ring(due);
+  if (timer_ring.on) {
+    const uint32_t limit = timer_ring.item.alarm ? ALARM_RING_MS : TIMER_RING_MS;
+    if (wakeword::takeStop()) {
+      stop_timer_ring("timer_stopped", "\"stop\"", false);
+    } else if (millis() - timer_ring.started > limit) {
+      stop_timer_ring("timer_missed", "nobody stopped it", false);
+    } else if (static_cast<int32_t>(millis() - timer_ring.next_sound) >= 0 && !audio::playing()) {
+      audio::play(timer_ring.item.alarm ? audio::Sound::Alarm : audio::Sound::TimerDone);
+      timer_ring.next_sound = millis() + RING_SOUND_EVERY_MS;
+      board::markActivity();  // the screen stays awake while it rings
+    }
+  }
+  wakeword::setStopListening(timer_ring.on && !audio::micMuted());
+  if (timers::version() != timers_sent) send_timers();
+}
+
 void update_voice() {
   if (tap_requested) {
     tap_requested = false;
@@ -1351,7 +1614,10 @@ void update_voice() {
   const bool idle = voice == Voice::Off && !ring_id.length() && !audio::micMuted() && !audio::speaking() &&
                     !audio::playing();
   wakeword::setListening(idle);
-  if (wakeword::takeDetection() && idle && ws_connected) {
+  const bool woke = wakeword::takeDetection() && idle;
+  if (woke && timer_ringing()) {
+    stop_timer_ring("timer_stopped", "the wake word", false);  // instead of starting a conversation
+  } else if (woke && ws_connected) {
     if (wake_arbitration && audio::ultrasonic()) {
       arbitrate();
     } else {
@@ -1437,6 +1703,12 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     send_text("{\"type\":\"pong\"}");
+  } else if (type == "timer") {
+    handle_timer(doc);
+  } else if (type == "notify") {
+    handle_notify(doc);
+  } else if (type == "notifications_clear") {
+    clear_notifications(false);
   } else if (type == "fetch_result") {
     fetch_result(doc);
   } else if (type == "local_changes_ack") {
@@ -1534,6 +1806,7 @@ void on_connected() {
   ws_down_since = 0;
   first_ws_config = true;
   local_changes_due = true;
+  timers_sent = UINT32_MAX;  // tell Harkenn what's set
   LOGI(TAG, via_relay ? "connected to Harkenn through the relay" : "connected to Harkenn");
   // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
   esp_ota_mark_app_valid_cancel_rollback();
@@ -1792,6 +2065,7 @@ bool run_online(bool use_relay = false) {
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
+    update_timers();
     update_screen();
     update_sleep();
     if (offer_install && offered_update) {
@@ -1959,6 +2233,8 @@ void main_task(void*) {
   volume = store::volume(70);
   audio::soundsBegin();  // the sound pack's clips, before the boot sound plays
   wakeword::begin();
+  timers::begin();
+  ui::onNotificationTap([] { note_reopen = true; });
   if (audio::begin(store::ultrasonic())) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());
