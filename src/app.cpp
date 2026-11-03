@@ -742,6 +742,18 @@ void send_json(JsonDocument& doc) {
   ws.sendTXT(out);
 }
 
+// Internal RAM (free now, largest block, lowest since boot) and each task's stack never used, for sizing them.
+void add_memory(JsonObject s) {
+  s["free_heap"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  s["largest_free"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  s["min_free_heap"] = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+  s["free_psram"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  JsonObject stacks = s["stack_free"].to<JsonObject>();
+  for (const char* name : {"harkenn", "loopTask", "web", "wakeword", "audio_out", "audio_in", "button"}) {
+    if (TaskHandle_t t = xTaskGetHandle(name)) stacks[name] = uxTaskGetStackHighWaterMark(t);
+  }
+}
+
 void send_status() {
   last_status = millis();
   if (!ws_connected) return;
@@ -754,8 +766,7 @@ void send_status() {
   s["ssid"] = WiFi.SSID();
   s["rssi"] = WiFi.RSSI();
   s["uptime_s"] = millis() / 1000;
-  s["free_heap"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-  s["free_psram"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  add_memory(s);
   s["battery"] = board::batteryPercent();
   s["charging"] = board::charging();
   s["volume"] = volume;
@@ -1507,8 +1518,7 @@ void start_web() {
     s["battery"] = board::batteryPercent();
     s["charging"] = board::charging();
     s["uptime_s"] = millis() / 1000;
-    s["free_heap"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    s["free_psram"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    add_memory(s);
     if (offered_version[0]) s["update_offered"] = offered_version;
   };
   h.set_volume = [](int v) { set_volume_local(v); };

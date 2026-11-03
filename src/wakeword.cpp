@@ -2,6 +2,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <freertos/idf_additions.h>
 #include <freertos/stream_buffer.h>
 
 #include "logbuf.h"
@@ -182,7 +183,10 @@ bool begin() {
   configure(config);
   frontend_ok = FrontendPopulateState(&config, &frontend, SAMPLE_RATE);
   if (!frontend_ok) LOGE(TAG, "audio frontend failed");
-  xTaskCreatePinnedToCore(task, "wakeword", 8192, nullptr, 3, nullptr, 0);
+  // Its stack in PSRAM, to spare internal RAM: allowed because this task never writes to flash.
+  if (xTaskCreatePinnedToCoreWithCaps(task, "wakeword", 8192, nullptr, 3, nullptr, 0, MALLOC_CAP_SPIRAM) != pdPASS) {
+    xTaskCreatePinnedToCore(task, "wakeword", 8192, nullptr, 3, nullptr, 0);
+  }
   LOGI(TAG, "wake word ready; internal RAM free %u (largest block %u)",
        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));

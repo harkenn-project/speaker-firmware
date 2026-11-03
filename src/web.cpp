@@ -119,7 +119,8 @@ bool guard() {
     send_error(401, "log in first");
     return false;
   }
-  session_used = last_use = millis();
+  session_used = millis();
+  last_use = session_used;
   return true;
 }
 
@@ -221,7 +222,8 @@ void handle_login() {
   char token[33];
   for (int i = 0; i < 16; i++) snprintf(token + 2 * i, 3, "%02x", static_cast<unsigned>(esp_random() & 0xff));
   session = token;
-  session_used = last_use = millis();
+  session_used = millis();
+  last_use = session_used;
   LOGI(TAG, "logged in with the %s password", which);
   server->sendHeader("Set-Cookie", "hk=" + session + "; Path=/; HttpOnly; SameSite=Strict");
   send_ok();
@@ -465,7 +467,8 @@ void handle_upload_data() {
     upload = Upload();
     upload.allowed = server->header("X-Requested-With") == "harkenn" && (open_access() || logged_in());
     if (!upload.allowed) return;
-    session_used = last_use = millis();
+    session_used = millis();
+    last_use = session_used;
     LOGI(TAG, "firmware upload: %s", up.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) upload.error = String("can't start: ") + Update.errorString();
     upload.started = !upload.error.length();

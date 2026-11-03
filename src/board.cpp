@@ -8,7 +8,7 @@ namespace {
 
 // Rotation 0-3, or 4-7 for the mirrored variants, if the image comes out rotated or mirrored.
 constexpr int DISPLAY_ROTATION = 0;
-constexpr int BUFFER_LINES = 40;
+constexpr int BUFFER_LINES = 20;  // two of these in internal RAM (DMA): 9.6 KB each
 
 class Panel : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
