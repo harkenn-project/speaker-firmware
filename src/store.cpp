@@ -74,7 +74,18 @@ std::vector<WifiNetwork> wifiNetworks() {
   std::vector<WifiNetwork> out;
   const uint8_t n = prefs.getUChar("wifi_n", 0);
   for (uint8_t i = 0; i < n && i < MAX_WIFI; i++) {
-    WifiNetwork w{get(("ssid" + String(i)).c_str(), ""), get(("pass" + String(i)).c_str(), "")};
+    WifiNetwork w;
+    w.ssid = get(("ssid" + String(i)).c_str(), "");
+    w.password = get(("pass" + String(i)).c_str(), "");
+    // static IP, as "ip,subnet,gateway,dns"
+    const String st = get(("ip" + String(i)).c_str(), "");
+    const int a = st.indexOf(','), b = st.indexOf(',', a + 1), c = st.indexOf(',', b + 1);
+    if (a > 0 && b > a && c > b) {
+      w.ip = st.substring(0, a);
+      w.subnet = st.substring(a + 1, b);
+      w.gateway = st.substring(b + 1, c);
+      w.dns = st.substring(c + 1);
+    }
     if (w.ssid.length()) out.push_back(w);
   }
   return out;
@@ -84,31 +95,46 @@ void saveWifiNetworks(const std::vector<WifiNetwork>& networks) {
   Lock l;
   const size_t n = min(networks.size(), MAX_WIFI);
   for (size_t i = 0; i < MAX_WIFI; i++) {
-    const String si = "ssid" + String(i), pi = "pass" + String(i);
+    const String si = "ssid" + String(i), pi = "pass" + String(i), ii = "ip" + String(i);
     if (i < n) {
-      prefs.putString(si.c_str(), networks[i].ssid);
-      prefs.putString(pi.c_str(), networks[i].password);
+      const WifiNetwork& w = networks[i];
+      prefs.putString(si.c_str(), w.ssid);
+      prefs.putString(pi.c_str(), w.password);
+      put_or_remove(ii.c_str(), w.ip.length() ? w.ip + "," + w.subnet + "," + w.gateway + "," + w.dns : String());
     } else {
-      if (prefs.isKey(si.c_str())) prefs.remove(si.c_str());
-      if (prefs.isKey(pi.c_str())) prefs.remove(pi.c_str());
+      for (const String& k : {si, pi, ii}) {
+        if (prefs.isKey(k.c_str())) prefs.remove(k.c_str());
+      }
     }
   }
   prefs.putUChar("wifi_n", n);
 }
 
-bool upsertWifi(const String& ssid, const String& password) {
+bool upsertWifi(const WifiNetwork& network) {
   auto list = wifiNetworks();
   for (auto it = list.begin(); it != list.end(); ++it) {
-    if (it->ssid == ssid) {
-      if (it->password == password) return false;
+    if (it->ssid == network.ssid) {
+      if (*it == network) return false;
       list.erase(it);
       break;
     }
   }
-  list.insert(list.begin(), WifiNetwork{ssid, password});
+  list.insert(list.begin(), network);
   if (list.size() > MAX_WIFI) list.resize(MAX_WIFI);
   saveWifiNetworks(list);
   return true;
+}
+
+bool removeWifi(const String& ssid) {
+  auto list = wifiNetworks();
+  for (auto it = list.begin(); it != list.end(); ++it) {
+    if (it->ssid == ssid) {
+      list.erase(it);
+      saveWifiNetworks(list);
+      return true;
+    }
+  }
+  return false;
 }
 
 int volume(int fallback) {
@@ -173,6 +199,66 @@ bool takePortalRequest() {
   const bool requested = prefs.getBool("portal", false);
   if (requested) prefs.remove("portal");  // only removed when present
   return requested;
+}
+
+LocalAccess localAccess() {
+  Lock l;
+  LocalAccess a;
+  a.admin_hash = get("adm_hash", "");
+  a.speaker_hash = get("spk_hash", "");
+  a.hotspot_psk = get("ap_psk", "");
+  a.unlock = prefs.isKey("unlock") ? prefs.getInt("unlock", 0) : 0;
+  return a;
+}
+
+void setLocalAccess(const LocalAccess& a) {
+  Lock l;
+  put_or_remove("adm_hash", a.admin_hash);
+  put_or_remove("spk_hash", a.speaker_hash);
+  put_or_remove("ap_psk", a.hotspot_psk);
+  prefs.putInt("unlock", a.unlock);
+}
+
+uint8_t loginFailures() {
+  Lock l;
+  return prefs.isKey("lk_fail") ? prefs.getUChar("lk_fail", 0) : 0;
+}
+
+void setLoginFailures(uint8_t failures) {
+  Lock l;
+  prefs.putUChar("lk_fail", failures);
+}
+
+bool loginLocked() {
+  Lock l;
+  return prefs.isKey("lk_perm") && prefs.getBool("lk_perm", false);
+}
+
+void setLoginLocked(bool locked) {
+  Lock l;
+  prefs.putBool("lk_perm", locked);
+}
+
+String localChanges() {
+  Lock l;
+  return get("local_chg", "");
+}
+
+uint32_t localChangesId() {
+  Lock l;
+  return prefs.isKey("local_id") ? prefs.getUInt("local_id", 0) : 0;
+}
+
+void setLocalChanges(const String& json) {
+  Lock l;
+  prefs.putString("local_chg", json);
+  prefs.putUInt("local_id", (prefs.isKey("local_id") ? prefs.getUInt("local_id", 0) : 0) + 1);
+}
+
+void clearLocalChanges(uint32_t id) {
+  Lock l;
+  if (!prefs.isKey("local_id") || prefs.getUInt("local_id", 0) != id) return;
+  if (prefs.isKey("local_chg")) prefs.remove("local_chg");
 }
 
 void factoryReset() {

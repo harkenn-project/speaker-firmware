@@ -18,20 +18,21 @@ supported.
 
 ## What it does
 
-1. **Wi-Fi.** With no saved network, it opens the access point `Harkenn-XXXX`. Join it, and a page at
-   `http://192.168.4.1` lets you pick a network. Networks pushed from the server are added to the saved list and never
-   removed.
+1. **Wi-Fi.** With no saved network, or when it can't join any of them for a minute, it opens the hotspot
+   `Harkenn-XXXX` and keeps trying its networks every minute. Join the hotspot and open `http://192.168.4.1` for the
+   speaker's own page (see *Its own web page* below). Networks pushed from the server are added to the saved list,
+   with a static IP if they have one.
 2. **Find the server.** It tries a saved address, then the `_harkenn._tcp` mDNS service, `harkenn.local`, and finally
-   the DNS name `harkenn`, until a Harkenn server answers `/api/v1/ping`; it sets its clock from the reply. The setup
-   page's *Advanced* field saves an address, and the server sends its own address in the config.
+   the DNS name `harkenn`, until a Harkenn server answers `/api/v1/ping`; it sets its clock from the reply. The
+   speaker's page saves an address, and the server sends its own address in the config.
 3. **Adoption.** It shows a 3-digit code. You enter the code in Harkenn, and the speaker saves its token in NVS.
 4. **Online.** It loads its config and downloads what it needs: the character animations (KANI, see `app/kani.py` in
    server-docker) at the size the layout needs, the sound pack's clips (kept in flash) and the wake word model. Its
    boot sound plays once all of that is in. It then holds a WebSocket to Harkenn:
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.
-   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state` and
-     `update_firmware` (see *Updates* below).
+   - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state`,
+     `update_firmware` (see *Updates* below) and `factory_reset`.
    - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
 5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
    while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
@@ -49,8 +50,27 @@ supported.
 10. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).
-    - Hold 6 s: opens Wi-Fi setup on the next boot, keeping saved networks.
-    - Hold 11 s: factory reset, forgetting Wi-Fi, the token and the server URL.
+    - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).
+    - Hold 11 s: factory reset, forgetting Wi-Fi, the token, the server URL and the passwords.
+
+## Its own web page
+
+For break-glass access when Harkenn can't reach the speaker: `http://<its IP>` on its network, or the hotspot (above)
+at `http://192.168.4.1`. It shows status and the recent logs, and lets you add, change or remove Wi-Fi networks (with
+static IP), set the server address, log level, volume and brightness, ask Harkenn for an update or upload a
+`firmware.bin`, restart, and factory reset.
+
+- **Passwords.** It takes the Harkenn admin password or the speaker's own password, which Harkenn makes at adoption
+  (shown once) and can change on the speaker's page in Harkenn. The speaker keeps only salted hashes of both. The
+  hotspot's Wi-Fi password is the speaker password too. A speaker that isn't adopted yet has no passwords, so its page
+  is open for the first-time setup.
+- **Lockout.** After 3 wrong passwords it waits 30 s, doubling every other try; after 10 it locks until it's unlocked
+  in Harkenn or factory reset with the button. Restarting doesn't skip a wait.
+- **Back to Harkenn.** Changes made on the page are sent to Harkenn when the speaker reaches it, and win over what's
+  set there. The hotspot goes off once it's connected to Harkenn again.
+
+The page is plain HTTP: the speaker doesn't have the memory for HTTPS next to everything else. On the hotspot the Wi-Fi
+link itself is encrypted (WPA2).
 
 ## Build and flash
 

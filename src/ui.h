@@ -37,7 +37,8 @@ void loop();  // run LVGL; call from the Arduino loop
 
 // Full-screen messages shown before the speaker is online.
 void showMessage(const char* title, const char* detail, bool spinner = true);
-void showWifiSetup(const char* apName);
+// The hotspot is up: join `apName` (with the speaker password when `secured`) and open 192.168.4.1.
+void showWifiSetup(const char* title, const char* apName, bool secured);
 void showAdoptionCode(const char* code, const char* host);
 // A progress bar (0-100); calling it again with the same title only updates the bar and the detail text.
 void showProgress(const char* title, const char* detail, int percent);

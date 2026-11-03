@@ -1,4 +1,4 @@
-// Persistent settings in NVS: server URL, device token, Wi-Fi networks.
+// Persistent settings in NVS: server URL, device token, Wi-Fi networks, the web page's passwords.
 #pragma once
 #include <Arduino.h>
 #include <vector>
@@ -8,6 +8,11 @@ namespace store {
 struct WifiNetwork {
   String ssid;
   String password;
+  String ip, gateway, subnet, dns;  // static IP on this network; empty ip = DHCP
+  bool operator==(const WifiNetwork& o) const {
+    return ssid == o.ssid && password == o.password && ip == o.ip && gateway == o.gateway && subnet == o.subnet &&
+           dns == o.dns;
+  }
 };
 constexpr size_t MAX_WIFI = 8;
 
@@ -28,7 +33,8 @@ void clearToken();
 std::vector<WifiNetwork> wifiNetworks();
 void saveWifiNetworks(const std::vector<WifiNetwork>& networks);
 // Adds or updates a network; the most recently added goes first. Returns true if anything changed.
-bool upsertWifi(const String& ssid, const String& password);
+bool upsertWifi(const WifiNetwork& network);
+bool removeWifi(const String& ssid);  // true if it was saved
 
 // Audio settings changed on the speaker itself. `configVolume` is the volume of the last config applied, so a config
 // only overrides the local volume when the volume in it changed.
@@ -51,6 +57,28 @@ void setDismissedUpdate(const String& version);
 void requestPortal();
 bool takePortalRequest();  // true once after requestPortal()
 
-void factoryReset();  // forget everything: Wi-Fi, token, server URL
+// The speaker's own web page (web.cpp). Hashes come from Harkenn's config ("local_access"): the admin password's
+// and the speaker password's ("pbkdf2_sha256$rounds$salt$digest", base64), and the hotspot's WPA2 key (64 hex
+// digits, itself derived from the speaker password).
+struct LocalAccess {
+  String admin_hash, speaker_hash, hotspot_psk;
+  int unlock = 0;  // Harkenn's unlock counter: a change clears the lockout
+};
+LocalAccess localAccess();
+void setLocalAccess(const LocalAccess& access);
+// Wrong passwords since the last right one, and whether the page is locked until Harkenn unlocks it.
+uint8_t loginFailures();
+void setLoginFailures(uint8_t failures);
+bool loginLocked();
+void setLoginLocked(bool locked);
+
+// Settings changed on the web page that Harkenn hasn't confirmed yet, as JSON (wifi, wifi_removed, log_level,
+// brightness, server_url). They win over the config until Harkenn acknowledges them by id.
+String localChanges();
+uint32_t localChangesId();
+void setLocalChanges(const String& json);  // gets a new id
+void clearLocalChanges(uint32_t id);       // only if nothing changed since that id
+
+void factoryReset();  // forget everything: Wi-Fi, token, server URL, passwords
 
 }  // namespace store

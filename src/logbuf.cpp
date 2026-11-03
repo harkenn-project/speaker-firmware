@@ -18,6 +18,16 @@ QueueHandle_t queue;
 vprintf_like_t idf_vprintf;
 volatile char upload_level = 'I';
 
+// The recent lines for the web page: a ring in PSRAM.
+constexpr size_t KEPT = 300;
+struct Kept {
+  uint32_t seq, up_ms;
+  Line line;
+};
+Kept* kept = nullptr;
+uint32_t kept_seq = 0;  // of the newest line
+portMUX_TYPE kept_lock = portMUX_INITIALIZER_UNLOCKED;
+
 int rank(char level) {
   switch (level) {
     case 'E': return 0;
@@ -37,6 +47,15 @@ void enqueue(char level, const char* tag, const char* message) {
   strlcpy(line.tag, tag, sizeof(line.tag));
   strlcpy(line.message, message, sizeof(line.message));
   xQueueSend(queue, &line, 0);  // drop when full rather than block
+  if (kept) {
+    const uint32_t up = millis();
+    portENTER_CRITICAL(&kept_lock);
+    Kept& k = kept[++kept_seq % KEPT];
+    k.seq = kept_seq;
+    k.up_ms = up;
+    k.line = line;
+    portEXIT_CRITICAL(&kept_lock);
+  }
 }
 
 // ESP-IDF lines look like "I (1234) wifi: message\n", possibly wrapped in ANSI colour codes.
@@ -72,6 +91,7 @@ int idf_hook(const char* fmt, va_list args) {
 
 void begin() {
   queue = xQueueCreate(64, sizeof(Line));
+  kept = static_cast<Kept*>(heap_caps_calloc(KEPT, sizeof(Kept), MALLOC_CAP_SPIRAM));
   idf_vprintf = esp_log_set_vprintf(idf_hook);
 }
 
@@ -100,5 +120,33 @@ size_t drain(JsonArray lines, size_t max) {
 }
 
 void setUploadLevel(char level) { upload_level = level; }
+
+char uploadLevel() { return upload_level; }
+
+uint32_t recent(JsonArray lines, uint32_t after, size_t max) {
+  if (!kept) return 0;
+  portENTER_CRITICAL(&kept_lock);
+  const uint32_t newest = kept_seq;
+  portEXIT_CRITICAL(&kept_lock);
+  uint32_t from = after + 1;
+  if (from > newest) return newest;  // nothing new (or the speaker restarted: the page starts over)
+  if (newest >= KEPT && from <= newest - KEPT) from = newest - KEPT + 1;  // older ones are overwritten
+  if (newest - from + 1 > max) from = newest - max + 1;
+  for (uint32_t seq = from; seq <= newest && seq; seq++) {
+    Kept k;
+    portENTER_CRITICAL(&kept_lock);
+    k = kept[seq % KEPT];
+    portEXIT_CRITICAL(&kept_lock);
+    if (k.seq != seq) continue;  // overwritten meanwhile
+    JsonObject o = lines.add<JsonObject>();
+    o["seq"] = k.seq;
+    o["ts"] = k.line.ts;
+    o["up_ms"] = k.up_ms;
+    o["level"] = String(k.line.level);
+    o["tag"] = k.line.tag;
+    o["message"] = k.line.message;
+  }
+  return newest;
+}
 
 }  // namespace logbuf

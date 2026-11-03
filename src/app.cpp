@@ -24,10 +24,10 @@
 #include "board.h"
 #include "ca_certs.h"
 #include "logbuf.h"
-#include "portal.h"
 #include "store.h"
 #include "ui.h"
 #include "wakeword.h"
+#include "web.h"
 
 namespace app {
 namespace {
@@ -42,6 +42,10 @@ constexpr uint32_t REPLY_TIMEOUT_MS = 60000;  // the first answer can be slow wh
 constexpr uint32_t RING_EVERY_MS = 3000;  // how often the ring repeats while ringing
 constexpr uint32_t CHIME_MS = 350;          // start listening after the activation chime, so it isn't sent
 constexpr uint32_t VOLUME_SETTLE_MS = 1000;  // save and report the volume once the finger stops
+constexpr uint32_t HOTSPOT_AFTER_MS = 60000;  // no saved network joined for this long: start the hotspot
+constexpr uint32_t HOTSPOT_RETRY_MS = 60000;  // with the hotspot up, try the saved networks this often...
+constexpr uint32_t HOTSPOT_QUIET_MS = 120000;  // ...but not while the page was used this recently (it drops clients)
+constexpr uint32_t PHYSICAL_HOTSPOT_MS = 600000;  // Wi-Fi setup from the button: wait this long before retrying
 
 struct ServerUrl {
   bool secure = true;
@@ -150,6 +154,16 @@ String screen_id;
 uint32_t screen_until = 0;
 volatile bool screen_tapped = false;
 char screen_tap_label[64];  // "" = dismissed
+
+// The web page (web.cpp) runs in its own task: it asks for these, and the main loop does them.
+volatile bool wifi_changed = false;        // saved networks changed: rebuild the list, try them now
+volatile bool reconnect_wanted = false;    // the server address changed
+volatile bool local_changes_due = true;    // send local changes to Harkenn (at every connection too)
+volatile bool update_check_wanted = false;
+volatile bool factory_reset_wanted = false;  // Harkenn asked
+char device_name[49] = "";
+char offered_version[32] = "";  // the firmware Harkenn offered, for the page
+bool static_ip_set = false;      // this connection uses a static IP from the saved network
 
 String ap_name() {
   String suffix = device_id.substring(8);
@@ -315,19 +329,82 @@ void rebuild_wifi() {
   }
 }
 
-void connect_wifi() {
-  const auto networks = store::wifiNetworks();
-  if (networks.empty()) portal::run(ap_name());
-  ui::showMessage("Connecting to Wi-Fi", networks.front().ssid.c_str());
-  WiFi.setHostname(("harkenn-" + device_id.substring(8)).c_str());
+// The hotspot, for the web page (web.cpp): WPA2 with the speaker password's key when Harkenn has sent one, else
+// open (a speaker that isn't adopted yet). `physical`: Wi-Fi setup opened with the button.
+void start_hotspot(bool physical) {
+  if (web::hotspotOn()) return;
+  const String psk = store::localAccess().hotspot_psk;
+  const bool secured = psk.length() == 64;
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(ap_name().c_str(), secured ? psk.c_str() : nullptr)) LOGE(TAG, "couldn't start the hotspot");
+  web::setHotspot(true, physical);
+  LOGI(TAG, "hotspot %s (%s) at %s", ap_name().c_str(), secured ? "speaker password" : "open",
+       WiFi.softAPIP().toString().c_str());
+  ui::showWifiSetup(physical ? "Wi-Fi setup" : "Can't join Wi-Fi", ap_name().c_str(), secured);
+}
+
+void stop_hotspot() {
+  if (!web::hotspotOn()) return;
+  web::setHotspot(false, false);
+  WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
-  int attempts = 0;
-  while (wifi->run(10000) != WL_CONNECTED) {
-    if (++attempts == 6) {
-      ui::showMessage("Can't join Wi-Fi", "Still trying. Hold the button 6 s for Wi-Fi setup.");
+  LOGI(TAG, "hotspot off");
+}
+
+// Static IP from the saved network we're on; DHCP when it has none.
+void apply_static_ip() {
+  const String ssid = WiFi.SSID();
+  for (const auto& n : store::wifiNetworks()) {
+    if (n.ssid != ssid || !n.ip.length()) continue;
+    IPAddress ip, gateway, subnet, dns;
+    if (!ip.fromString(n.ip) || !gateway.fromString(n.gateway) || !subnet.fromString(n.subnet)) return;
+    if (!dns.fromString(n.dns)) dns = gateway;
+    if (WiFi.localIP() == ip && static_ip_set) return;
+    if (WiFi.config(ip, gateway, subnet, dns)) {
+      static_ip_set = true;
+      LOGI(TAG, "static IP %s on %s", n.ip.c_str(), ssid.c_str());
+    } else {
+      LOGE(TAG, "couldn't set static IP %s", n.ip.c_str());
     }
-    delay(500);
+    return;
   }
+  if (static_ip_set) {  // moved to a network without one
+    WiFi.config(IPAddress(), IPAddress(), IPAddress());
+    static_ip_set = false;
+    LOGI(TAG, "DHCP on %s", ssid.c_str());
+  }
+}
+
+// Joins a saved network. Without one for a minute (or with none saved, or `physical`), the hotspot comes up for the
+// web page, and the saved networks are still tried every minute. Doesn't return until a network is joined.
+void connect_wifi(bool physical) {
+  WiFi.setHostname(("harkenn-" + device_id.substring(8)).c_str());
+  if (physical || store::wifiNetworks().empty()) {
+    start_hotspot(physical);
+  } else {
+    if (!web::hotspotOn()) WiFi.mode(WIFI_STA);
+    ui::showMessage("Connecting to Wi-Fi", store::wifiNetworks().front().ssid.c_str());
+  }
+  const uint32_t started = millis();
+  uint32_t next_try = physical ? started + PHYSICAL_HOTSPOT_MS : started;
+  for (;;) {
+    bool now = false;
+    if (wifi_changed) {  // saved on the page: try it straight away
+      wifi_changed = false;
+      rebuild_wifi();
+      now = true;
+    }
+    const bool due = static_cast<int32_t>(millis() - next_try) >= 0 &&
+                     !(web::hotspotOn() && web::inUse(HOTSPOT_QUIET_MS));
+    if (!store::wifiNetworks().empty() && (now || due)) {
+      if (wifi->run(10000) == WL_CONNECTED) break;
+      next_try = millis() + (web::hotspotOn() ? HOTSPOT_RETRY_MS : 500);
+    }
+    if (!web::hotspotOn() && millis() - started > HOTSPOT_AFTER_MS) start_hotspot(false);
+    delay(200);
+  }
+  static_ip_set = false;
+  apply_static_ip();
   LOGI(TAG, "Wi-Fi: %s, IP %s, RSSI %d", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   configTzTime(timezone.c_str(), "pool.ntp.org", "time.google.com");
   MDNS.begin(("harkenn-" + device_id.substring(8)).c_str());  // for finding the server
@@ -383,7 +460,9 @@ bool find_server() {
       }
     }
     LOGW(TAG, "no Harkenn server found yet");
-    ui::showMessage("Looking for Harkenn", "Set its address on the Wi-Fi setup page if this takes long", true);
+    const String hint = web::hotspotOn() ? "Set its address on hotspot " + ap_name() + ", at 192.168.4.1"
+                                         : "Set its address at http://" + WiFi.localIP().toString();
+    ui::showMessage("Looking for Harkenn", hint.c_str(), true);
     delay(3000);
   }
   return false;
@@ -510,9 +589,38 @@ bool apply_wake_word(JsonVariantConst w) {
   return ok;
 }
 
+bool has_ssid(JsonVariantConst list, const String& ssid) {
+  for (JsonVariantConst v : list.as<JsonArrayConst>()) {
+    if ((v.is<JsonObjectConst>() ? String(v["ssid"] | "") : String(v | "")) == ssid) return true;
+  }
+  return false;
+}
+
+// What the web page needs from the config: password hashes, the hotspot key, the unlock counter.
+void apply_local_access(JsonVariantConst la) {
+  if (la.isNull()) return;  // an older Harkenn: keep what we have
+  store::LocalAccess next;
+  next.admin_hash = la["admin_hash"] | "";
+  next.speaker_hash = la["speaker_hash"] | "";
+  next.hotspot_psk = la["hotspot_psk"] | "";
+  next.unlock = la["unlock"] | 0;
+  const store::LocalAccess old = store::localAccess();
+  if (next.unlock != old.unlock && (web::failures() || web::locked())) web::unlock();
+  if (next.admin_hash != old.admin_hash || next.speaker_hash != old.speaker_hash ||
+      next.hotspot_psk != old.hotspot_psk || next.unlock != old.unlock) {
+    store::setLocalAccess(next);
+    LOGI(TAG, "web page passwords updated");
+  }
+}
+
 void apply_config(JsonDocument& doc) {
   JsonObject cfg = doc["config"];
   JsonObject display = cfg["display"];
+  // Changes made on the web page that Harkenn hasn't confirmed yet win over the config.
+  JsonDocument local;
+  if (deserializeJson(local, store::localChanges())) local.to<JsonObject>();
+  strlcpy(device_name, doc["device"]["name"] | "", sizeof(device_name));
+  apply_local_access(doc["local_access"]);
 
   ui::Theme theme;
   JsonObject th = doc["theme"];
@@ -570,7 +678,7 @@ void apply_config(JsonDocument& doc) {
   }
   blobs = next;
 
-  brightness = display["brightness"] | 75;
+  brightness = local["brightness"].is<int>() ? local["brightness"].as<int>() : (display["brightness"] | 75);
   sleep_after_ms = static_cast<uint32_t>(display["sleep_after_s"] | 300) * 1000;
   silence_ms = constrain(cfg["audio"]["silence_s"] | 5, 1, 30) * 1000;
   // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
@@ -584,17 +692,25 @@ void apply_config(JsonDocument& doc) {
   timezone = cfg["timezone"] | "UTC0";
   setenv("TZ", timezone.c_str(), 1);
   tzset();
-  const String level = cfg["log_level"] | "info";
+  const String level = local["log_level"] | (cfg["log_level"] | "info");
   logbuf::setUploadLevel(level == "error" ? 'E' : level == "warn" ? 'W' : level == "debug" ? 'D' : 'I');
 
-  // Wi-Fi networks from the server are added to the saved list; nothing is ever removed from here.
-  bool wifi_changed = false;
+  // Wi-Fi networks from the server are added to the saved list (or updated); only the web page removes any.
+  bool networks_changed = false;
   for (JsonObject n : cfg["wifi"].as<JsonArray>()) {
-    const String ssid = n["ssid"] | "";
-    if (ssid.length()) wifi_changed |= store::upsertWifi(ssid, n["password"] | "");
+    store::WifiNetwork w;
+    w.ssid = n["ssid"] | "";
+    if (!w.ssid.length() || has_ssid(local["wifi_removed"], w.ssid) || has_ssid(local["wifi"], w.ssid)) continue;
+    w.password = n["password"] | "";
+    w.ip = n["ip"] | "";
+    w.subnet = n["subnet"] | "";
+    w.gateway = n["gateway"] | "";
+    w.dns = n["dns"] | "";
+    networks_changed |= store::upsertWifi(w);
   }
-  if (wifi_changed) {
+  if (networks_changed) {
     rebuild_wifi();
+    apply_static_ip();
     LOGI(TAG, "Wi-Fi list updated: %u networks", store::wifiNetworks().size());
   }
 
@@ -646,7 +762,19 @@ void send_status() {
   s["muted"] = audio::micMuted();
   s["brightness"] = brightness;
   s["config_version"] = config_version;
+  s["local_failures"] = web::failures();
+  s["local_locked"] = web::locked();
+  s["hotspot"] = web::hotspotOn();
   send_json(doc);
+}
+
+// Settings changed on the web page, until Harkenn acknowledges them (local_changes_ack).
+void send_local_changes() {
+  local_changes_due = false;
+  const String changes = store::localChanges();
+  if (!ws_connected || !changes.length()) return;
+  ws.sendTXT("{\"type\":\"local_changes\",\"id\":" + String(store::localChangesId()) + ",\"changes\":" + changes + "}");
+  LOGI(TAG, "sent the changes made on the web page");
 }
 
 // Tells Harkenn about settings changed on the speaker, so its stored config matches.
@@ -1031,6 +1159,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
     ws.sendTXT("{\"type\":\"pong\"}");
+  } else if (type == "local_changes_ack") {
+    store::clearLocalChanges(doc["id"] | 0);  // the config Harkenn sends next includes them
   } else if (type.startsWith("speak_") || type.startsWith("voice_") || type.startsWith("ring") ||
              type == "listen_stop") {
     handle_voice_message(type, doc);
@@ -1080,6 +1210,7 @@ void handle_text(const uint8_t* payload, size_t len) {
       return;
     }
     LOGI(TAG, "firmware %s available", fw->version.c_str());
+    strlcpy(offered_version, fw->version.c_str(), sizeof(offered_version));
     ui::showUpdateOffer(fw->version.c_str(), [] { offer_install = true; }, [] { offer_dismiss = true; });
     board::markActivity();
     offered_update = std::move(fw);
@@ -1089,6 +1220,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     LOGI(TAG, "command %s", command.c_str());
     if (command == "reboot") {
       restart();
+    } else if (command == "factory_reset") {
+      factory_reset_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
     } else if (command == "refresh_config") {
@@ -1121,6 +1254,7 @@ void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
       ws_connected = true;
       ws_down_since = 0;
       first_ws_config = true;
+      local_changes_due = true;
       LOGI(TAG, "connected to Harkenn");
       // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
       esp_ota_mark_app_valid_cancel_rollback();
@@ -1239,18 +1373,47 @@ bool run_online() {
       want_config = false;
       ws.sendTXT("{\"type\":\"config_request\"}");
     }
+    // asked for on the web page
+    if (local_changes_due && ws_connected) send_local_changes();
+    if (update_check_wanted && ws_connected) {
+      update_check_wanted = false;
+      ws.sendTXT("{\"type\":\"update_check\"}");
+    }
+    if (wifi_changed) {
+      wifi_changed = false;
+      rebuild_wifi();
+      apply_static_ip();
+    }
+    if (ws_connected && web::hotspotOn()) stop_hotspot();  // back with Harkenn: the page is on the network now
+    if (reconnect_wanted) {
+      reconnect_wanted = false;
+      ws.disconnect();
+      return true;  // starts over with the new server address
+    }
+    if (factory_reset_wanted) {
+      LOGW(TAG, "factory reset requested by Harkenn");
+      flush_logs();
+      ws.disconnect();
+      ui::showMessage("Factory reset", "Starting over", false);
+      store::factoryReset();
+      delay(1000);
+      ESP.restart();
+    }
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
     update_screen();
     update_sleep();
     if (offer_install && offered_update) {
-      LOGI(TAG, "installing firmware %s from the screen", offered_update->version.c_str());
+      LOGI(TAG, "installing firmware %s", offered_update->version.c_str());
+      ui::hideUpdateOffer();
       pending_update = std::move(offered_update);
+      offered_version[0] = 0;
     } else if (offer_dismiss && offered_update) {
       LOGI(TAG, "firmware %s dismissed", offered_update->version.c_str());
       store::setDismissedUpdate(offered_update->version);
       offered_update.reset();
+      offered_version[0] = 0;
     }
     offer_install = offer_dismiss = false;
     if (pending_update) {
@@ -1322,6 +1485,55 @@ void button_task(void*) {
   }
 }
 
+// The web page's view of the speaker, and what it can ask for (it runs in its own task).
+void start_web() {
+  web::Hooks h;
+  h.status = [](JsonObject s) {
+    s["name"] = device_name;
+    s["device_id"] = device_id;
+    s["firmware"] = FW_VERSION;
+    s["hardware"] = HARDWARE_ID;
+    s["adopted"] = token.length() > 0;
+    s["connected"] = ws_connected;
+    s["server"] = server_url;
+    s["ap_name"] = ap_name();
+    s["ssid"] = WiFi.isConnected() ? WiFi.SSID() : String();
+    if (WiFi.isConnected()) s["rssi"] = WiFi.RSSI();
+    s["ip"] = WiFi.isConnected() ? WiFi.localIP().toString() : String();
+    s["state"] = ui::state();
+    s["volume"] = static_cast<int>(volume);
+    s["muted"] = audio::micMuted();
+    s["brightness"] = brightness;
+    s["battery"] = board::batteryPercent();
+    s["charging"] = board::charging();
+    s["uptime_s"] = millis() / 1000;
+    s["free_heap"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s["free_psram"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (offered_version[0]) s["update_offered"] = offered_version;
+  };
+  h.set_volume = [](int v) { set_volume_local(v); };
+  h.set_brightness = [](int b) {
+    brightness = b;
+    if (!dimmed) board::setBrightness(b);
+  };
+  h.wifi_changed = [] { wifi_changed = true; };
+  h.server_changed = [] { reconnect_wanted = true; };
+  h.changes_recorded = [] { local_changes_due = true; };
+  h.check_update = [] {
+    if (!ws_connected) return false;
+    store::setDismissedUpdate("");  // asked for: offer it even if it was dismissed on the screen
+    update_check_wanted = true;
+    return true;
+  };
+  h.install_offered = [] {
+    if (!offered_version[0]) return false;
+    offer_install = true;
+    return true;
+  };
+  h.restart = [] { restart(); };
+  web::begin(h);
+}
+
 void main_task(void*) {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -1358,11 +1570,15 @@ void main_task(void*) {
 
   ui::showMessage("Starting", ap_name().c_str());
   board::setBrightness(brightness);
-  if (store::takePortalRequest() || store::wifiNetworks().empty()) portal::run(ap_name());
+  start_web();
+  bool physical = store::takePortalRequest();  // held the button for Wi-Fi setup
   rebuild_wifi();
 
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED) connect_wifi();
+    if (WiFi.status() != WL_CONNECTED) {
+      connect_wifi(physical);
+      physical = false;
+    }
     if (!find_server()) continue;
     if (!token.length() && !adopt()) continue;
     if (!run_online()) {

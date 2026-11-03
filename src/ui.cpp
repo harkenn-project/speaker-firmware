@@ -522,14 +522,15 @@ void showMessage(const char* title, const char* detail, bool spinner) {
   label(scr, detail, &lv_font_montserrat_14, theme.muted, 40, top + 46, 160, 54, 3);
 }
 
-void showWifiSetup(const char* apName) {
+void showWifiSetup(const char* title, const char* apName, bool secured) {
   Lock l;
   lv_obj_t* scr = reset_screen();
-  label(scr, "Wi-Fi setup", &lv_font_montserrat_18, theme.text, 40, 40, 160, 24);
-  label(scr, "Join the network", &lv_font_montserrat_14, theme.muted, 30, 76, 180, 18);
-  label(scr, apName, &lv_font_montserrat_24, theme.primary, 14, 98, 212, 30);
-  label(scr, "then open", &lv_font_montserrat_14, theme.muted, 40, 140, 160, 18);
-  label(scr, "192.168.4.1", &lv_font_montserrat_18, theme.text, 40, 160, 160, 24);
+  label(scr, title, &lv_font_montserrat_18, theme.text, 40, 36, 160, 24);
+  label(scr, "Join the network", &lv_font_montserrat_14, theme.muted, 30, 70, 180, 18);
+  label(scr, apName, &lv_font_montserrat_24, theme.primary, 14, 90, 212, 30);
+  label(scr, "then open", &lv_font_montserrat_14, theme.muted, 40, 128, 160, 18);
+  label(scr, "192.168.4.1", &lv_font_montserrat_18, theme.text, 40, 146, 160, 24);
+  if (secured) label(scr, "Wi-Fi password: the speaker password", &lv_font_montserrat_14, theme.muted, 40, 176, 160, 36, 2);
 }
 
 void showAdoptionCode(const char* code, const char* host) {
