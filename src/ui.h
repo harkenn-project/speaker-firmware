@@ -53,6 +53,8 @@ void identify();                       // blink the screen for a few seconds
 
 // Mic muted: while idle or sleeping, the character shows its muted animation and the ring turns orange.
 void setMuted(bool muted);
+// While the screen sleeps with the "clock" display: only a big clock, over everything else.
+void showSleepClock(bool on);
 // Connected through the relay (away from home): a small icon at the top of every screen.
 void setRemote(bool on);
 

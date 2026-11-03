@@ -273,8 +273,12 @@ const char* default_status(const String& state) {
   return "";
 }
 
+// The "clock" sleep display: a big clock over everything (on the top layer, so a new layout doesn't remove it).
+lv_obj_t* sleep_panel = nullptr;
+lv_obj_t* sleep_clock = nullptr;
+
 void update_clock(lv_timer_t* = nullptr) {
-  if (!clock_label && !date_label) return;
+  if (!clock_label && !date_label && !sleep_clock) return;
   const time_t now = time(nullptr);
   struct tm t;
   localtime_r(&now, &t);
@@ -285,6 +289,12 @@ void update_clock(lv_timer_t* = nullptr) {
     else if (clock_24h) strftime(buf, sizeof(buf), "%H:%M", &t);
     else snprintf(buf, sizeof(buf), "%d:%02d", t.tm_hour % 12 ? t.tm_hour % 12 : 12, t.tm_min);
     lv_label_set_text(clock_label, buf);
+  }
+  if (sleep_clock) {
+    if (!valid) strcpy(buf, "--:--");
+    else if (clock_24h) strftime(buf, sizeof(buf), "%H:%M", &t);
+    else snprintf(buf, sizeof(buf), "%d:%02d", t.tm_hour % 12 ? t.tm_hour % 12 : 12, t.tm_min);
+    lv_label_set_text(sleep_clock, buf);
   }
   if (date_label) {
     if (valid) strftime(buf, sizeof(buf), "%a %e %b", &t);
@@ -625,6 +635,26 @@ void setMuted(bool m) {
   if (muted == m) return;
   muted = m;
   apply_state();
+}
+
+void showSleepClock(bool on) {
+  Lock l;
+  if (on && !sleep_panel) {
+    sleep_panel = lv_obj_create(lv_layer_top());  // clickable: a tap only wakes the screen, it doesn't start talking
+    lv_obj_remove_style_all(sleep_panel);
+    lv_obj_set_size(sleep_panel, 240, 240);
+    lv_obj_set_style_bg_color(sleep_panel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sleep_panel, LV_OPA_COVER, 0);
+    lv_obj_move_background(sleep_panel);  // under the remote icon
+    sleep_clock = lv_label_create(sleep_panel);
+    lv_obj_set_style_text_font(sleep_clock, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(sleep_clock, color(theme.text), 0);
+    lv_obj_center(sleep_clock);
+    update_clock();
+  } else if (!on && sleep_panel) {
+    lv_obj_delete(sleep_panel);
+    sleep_panel = sleep_clock = nullptr;
+  }
 }
 
 void setRemote(bool on) {

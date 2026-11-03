@@ -33,21 +33,26 @@ supported.
    - It sends status every 30 s and log lines every 2 s.
    - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state`,
      `update_firmware` (see *Updates* below) and `factory_reset`.
-   - The screen dims after `sleep_after_s` without a touch, and the character switches to its sleeping animation.
+   - The screen sleeps after `sleep_after_s` without a touch: dimmed with the character's sleeping animation,
+     dimmed with only a big clock, or off (`sleep_display`).
 5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
    while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
    in the config.
-6. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
+6. **Only the nearest answers.** When several speakers hear the wake word, the one that heard it loudest answers:
+   it plays a short tone at 19 kHz, too high for people to hear, and the others stand down (Harkenn's
+   `audio.wake_arbitration`, on by default). The codec runs at 48 kHz for this, filtered to 16 kHz for everything
+   else.
+7. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
    until you stop talking (Harkenn decides when, after `audio.silence_s` of silence) or tap again. Harkenn answers
    with speech, which the speaker plays while the character talks; a tap stops it. When the assistant asks
    something, the speaker plays a soft cue and listens for the answer without the wake word.
-7. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
+8. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
    home screen until it's dismissed or times out; tapping an area sends its label back as the next turn.
-8. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
+9. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
    taps to answer.
-9. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
+10. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
    wins over the config unless the volume in the config changes.
-10. **BOOT button.**
+11. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).
     - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).

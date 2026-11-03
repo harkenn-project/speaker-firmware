@@ -11,6 +11,7 @@
 #include <Update.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
+#include <esp_random.h>
 #include <esp_sleep.h>
 #include <mbedtls/sha256.h>
 #include <sys/time.h>
@@ -90,6 +91,7 @@ volatile int volume = 70;
 uint32_t sleep_after_ms = 300000;
 uint32_t silence_ms = 5000;  // stop listening after this long without speech
 bool dimmed = false;
+String sleep_display = "character";  // character, clock or off (update_sleep)
 std::map<String, std::shared_ptr<ui::Blob>> blobs;  // animations by URL, so unchanged ones aren't downloaded again
 ui::CharacterSet shown;  // the animations on screen, kept for a state whose new download fails
 
@@ -215,7 +217,9 @@ std::unique_ptr<FirmwareUpdate> offered_update;  // shown on screen as "Update a
 volatile bool offer_install = false, offer_dismiss = false;
 bool update_checked = false;  // asked Harkenn for updates since boot
 
-enum class Voice { Off, Starting, Listening, Waiting, Speaking };
+enum class Voice { Off, Arbitrating, Starting, Listening, Waiting, Speaking };
+bool wake_arbitration = true;      // config audio.wake_arbitration: only the nearest speaker answers (arbitrate())
+uint32_t arbitration_started = 0;
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
 uint32_t voice_session = 0;
@@ -838,7 +842,10 @@ void apply_config(JsonDocument& doc) {
 
   brightness = local["brightness"].is<int>() ? local["brightness"].as<int>() : (display["brightness"] | 75);
   sleep_after_ms = static_cast<uint32_t>(display["sleep_after_s"] | 300) * 1000;
+  sleep_display = display["sleep_display"] | "character";
+  ui::showSleepClock(false);  // the config wakes the screen (below)
   silence_ms = constrain(cfg["audio"]["silence_s"] | 5, 1, 30) * 1000;
+  wake_arbitration = cfg["audio"]["wake_arbitration"] | true;
   // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
   const int config_volume = constrain(cfg["audio"]["volume"] | 70, 0, 100);
   if (config_volume != store::configVolume()) {
@@ -1086,14 +1093,41 @@ void start_ringing(const String& id, uint32_t seconds) {
 }
 
 // A new conversation (tap, wake word) plays the wake sound; listening for a reply after speaking plays a soft cue.
-void start_listening_turn(bool after_speech = false, bool follow_up = false) {
+// `queued_ms`: sound already queued before the cue (the claim tone), so listening starts after both.
+void start_listening_turn(bool after_speech = false, bool follow_up = false, uint32_t queued_ms = 0) {
   const audio::Sound cue = after_speech ? audio::Sound::Listen : audio::Sound::Activate;
   audio::play(cue);
   follow_up_turn = follow_up;
   ui::setState("listening");
   voice = Voice::Starting;
   // start listening once the cue has played (a voiced wake sound is longer than a chime), so it isn't sent
-  voice_at = millis() + max(CHIME_MS, audio::soundMs(cue) + 120);
+  voice_at = millis() + queued_ms + max(CHIME_MS, audio::soundMs(cue) + 120);
+}
+
+// Wake word arbitration: when several speakers hear the wake word, only the one that heard it loudest answers.
+// Each waits longer the quieter it heard it, then plays the claim tone (above hearing) and answers; a speaker that
+// hears another's tone first, or heard one just before (wake word detection takes a little longer on some
+// speakers), stays quiet.
+constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: no wait
+constexpr uint32_t ARBITRATION_MS_PER_DB = 12;
+constexpr uint32_t ARBITRATION_MAX_MS = 360;
+constexpr uint32_t ARBITRATION_JITTER_MS = 20;  // two speakers that heard it equally loud rarely claim together
+constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;
+
+void arbitrate() {
+  const int db = audio::recentLevelDb();
+  audio::claimLevel();  // start the peak over
+  const uint32_t heard = audio::claimHeardAt();
+  if (heard && millis() - heard < CLAIM_LOOKBACK_MS) {
+    LOGI(TAG, "wake word at %d dBFS: a closer speaker already answered; staying quiet", db);
+    return;
+  }
+  const uint32_t wait = min<uint32_t>(max(0, ARBITRATION_LOUD_DB - db) * ARBITRATION_MS_PER_DB, ARBITRATION_MAX_MS) +
+                        esp_random() % ARBITRATION_JITTER_MS;
+  LOGI(TAG, "wake word at %d dBFS: answering in %u ms unless a closer speaker does", db, static_cast<unsigned>(wait));
+  arbitration_started = millis();
+  voice = Voice::Arbitrating;
+  voice_at = millis() + wait;
 }
 
 void handle_tap() {
@@ -1254,8 +1288,22 @@ void update_voice() {
                     !audio::playing();
   wakeword::setListening(idle);
   if (wakeword::takeDetection() && idle && ws_connected) {
-    board::markActivity();  // wake the screen
-    start_listening_turn();
+    if (wake_arbitration) {
+      arbitrate();
+    } else {
+      board::markActivity();  // wake the screen
+      start_listening_turn();
+    }
+  }
+  if (voice == Voice::Arbitrating) {
+    if (audio::claimHeardAt() && static_cast<int32_t>(audio::claimHeardAt() - arbitration_started) >= 0) {
+      LOGI(TAG, "wake word: a closer speaker is answering (its tone at %d); staying quiet", audio::claimLevel());
+      voice = Voice::Off;
+    } else if (static_cast<int32_t>(millis() - voice_at) >= 0) {
+      audio::play(audio::Sound::Claim);  // tell the others, then answer
+      board::markActivity();
+      start_listening_turn(false, false, audio::CLAIM_MS);
+    }
   }
   static uint32_t last_stats = 0;
   if (wakeword::loaded() && millis() - last_stats > 60000) {
@@ -1547,16 +1595,20 @@ void run_firmware_update() {
   restart();
 }
 
+// After sleep_after_ms without a touch the screen sleeps (config display.sleep_display): dimmed with the character
+// sleeping, dimmed with only a big clock, or off. A touch, the wake word or anything Harkenn shows wakes it.
 void update_sleep() {
   if (!sleep_after_ms) return;
   const bool idle = millis() - board::lastTouchMs() > sleep_after_ms;
   if (idle && !dimmed) {
     dimmed = true;
-    board::setBrightness(max(5, brightness / 8));
+    board::setBrightness(sleep_display == "off" ? 0 : max(5, brightness / 8));
+    if (sleep_display == "clock") ui::showSleepClock(true);
     if (strcmp(ui::state(), "idle") == 0) ui::setState("sleeping");
     send_status();
   } else if (!idle && dimmed) {
     dimmed = false;
+    ui::showSleepClock(false);
     board::setBrightness(brightness);
     if (strcmp(ui::state(), "sleeping") == 0) ui::setState("idle");
     send_status();

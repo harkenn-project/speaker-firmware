@@ -6,6 +6,8 @@
 #include <freertos/stream_buffer.h>
 #include <math.h>
 
+#include <esp_random.h>
+
 #include "board.h"
 #include "logbuf.h"
 #include "wakeword.h"
@@ -15,7 +17,8 @@ namespace {
 
 constexpr const char* TAG = "audio";
 constexpr uint8_t ES8311 = 0x18;
-constexpr size_t CHUNK = 256;            // samples per I2S write/read
+constexpr size_t CHUNK = 256;            // 16 kHz samples per write/read (16 ms)
+constexpr int RATIO = HW_RATE / SAMPLE_RATE;
 constexpr uint32_t AMP_OFF_AFTER_MS = 200;  // after the last sound, so the DMA buffers drain first
 
 i2s_chan_handle_t tx = nullptr, rx = nullptr;
@@ -42,8 +45,9 @@ int rd(uint8_t reg) {
   return Wire.read();
 }
 
-// ES8311 as I2S slave, MCLK = 256 x 16 kHz from the ESP32, 16-bit I2S both ways, analog mic.
-// Register values follow Espressif's es8311 driver (coefficients for 4.096 MHz MCLK / 16 kHz).
+// ES8311 as I2S slave, MCLK = 256 x 48 kHz from the ESP32, 16-bit I2S both ways, analog mic.
+// Register values follow Espressif's es8311 driver (coefficients for 12.288 MHz MCLK / 48 kHz: the same dividers as
+// for 4.096 MHz / 16 kHz, since only the ratio matters).
 bool codec_init() {
   if (rd(0xFD) < 0) return false;  // chip ID register: just checks the codec answers
   const uint8_t init[][2] = {
@@ -52,7 +56,7 @@ bool codec_init() {
       {0x0B, 0x00}, {0x0C, 0x00}, {0x10, 0x1F}, {0x11, 0x7F},
       {0x00, 0x80},                                                    // power on, slave mode
       {0x01, 0x3F},                                                    // all clocks on, MCLK from the pin
-      {0x02, 0x00}, {0x05, 0x00}, {0x03, 0x10}, {0x04, 0x10},          // dividers for 16 kHz
+      {0x02, 0x00}, {0x05, 0x00}, {0x03, 0x10}, {0x04, 0x10},          // dividers for MCLK = 256 fs
       {0x07, 0x00}, {0x08, 0xFF}, {0x06, 0x03},
       {0x13, 0x10}, {0x1B, 0x0A}, {0x1C, 0x6A},                        // ADC high-pass (removes DC)
       {0x09, 0x0C}, {0x0A, 0x0C},                                      // DAC/ADC: I2S, 16-bit
@@ -83,11 +87,11 @@ void apply_mic() {
 bool i2s_init() {
   i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan.dma_desc_num = 6;
-  chan.dma_frame_num = 240;
+  chan.dma_frame_num = 480;  // 10 ms at 48 kHz
   chan.auto_clear = true;  // send silence when nothing is queued, instead of repeating the last buffer
   if (i2s_new_channel(&chan, &tx, &rx) != ESP_OK) return false;
   i2s_std_config_t std = {
-      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(HW_RATE),
       .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
       .gpio_cfg =
           {
@@ -105,6 +109,57 @@ bool i2s_init() {
   in.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
   return i2s_channel_init_std_mode(tx, &std) == ESP_OK && i2s_channel_init_std_mode(rx, &in) == ESP_OK &&
          i2s_channel_enable(tx) == ESP_OK && i2s_channel_enable(rx) == ESP_OK;
+}
+
+// 16 <-> 48 kHz: one low-pass FIR (windowed sinc, cut at 7 kHz) used to decimate the microphone and to interpolate
+// everything played, so nothing above 8 kHz goes to the rest of the speaker and nothing it plays reaches the
+// claim tone's band.
+
+constexpr int TAPS = 96;              // 32 per phase
+constexpr int PHASE_TAPS = TAPS / RATIO;
+float fir[TAPS];
+
+void fir_init() {
+  const float fc = 7000.0f / HW_RATE, mid = (TAPS - 1) / 2.0f;
+  float sum = 0;
+  for (int k = 0; k < TAPS; k++) {
+    const float x = k - mid;
+    const float sinc = x == 0 ? 2 * fc : sinf(2 * PI * fc * x) / (PI * x);
+    const float blackman = 0.42f - 0.5f * cosf(2 * PI * k / (TAPS - 1)) + 0.08f * cosf(4 * PI * k / (TAPS - 1));
+    fir[k] = sinc * blackman;
+    sum += fir[k];
+  }
+  for (float& h : fir) h /= sum;  // unity gain at DC
+}
+
+int16_t clip16(float v) { return static_cast<int16_t>(constrain(v, -32768.0f, 32767.0f)); }
+
+// 48 kHz in (n samples, a multiple of RATIO), 16 kHz out.
+void decimate(const int16_t* in, size_t n, int16_t* out) {
+  static float ext[TAPS - 1 + CHUNK * RATIO];  // the last TAPS-1 inputs, then this block
+  for (size_t i = 0; i < n; i++) ext[TAPS - 1 + i] = in[i];
+  for (size_t j = 0; j < n / RATIO; j++) {
+    const float* x = ext + TAPS - 1 + RATIO * j + RATIO - 1;
+    float y = 0;
+    for (int k = 0; k < TAPS; k++) y += fir[k] * x[-k];
+    out[j] = clip16(y);
+  }
+  memmove(ext, ext + n, (TAPS - 1) * sizeof(float));
+}
+
+// 16 kHz in (n samples), 48 kHz out (n * RATIO). Only the play task calls it.
+void interpolate(const int16_t* in, size_t n, int16_t* out) {
+  static float ext[PHASE_TAPS - 1 + CHUNK];
+  for (size_t i = 0; i < n; i++) ext[PHASE_TAPS - 1 + i] = in[i];
+  for (size_t i = 0; i < n; i++) {
+    const float* x = ext + PHASE_TAPS - 1 + i;
+    for (int ph = 0; ph < RATIO; ph++) {
+      float y = 0;
+      for (int j = 0; j < PHASE_TAPS; j++) y += fir[ph + RATIO * j] * x[-j];
+      out[RATIO * i + ph] = clip16(RATIO * y);
+    }
+  }
+  memmove(ext, ext + n, (PHASE_TAPS - 1) * sizeof(float));
 }
 
 // Sounds: short note sequences, synthesized as a soft bell (sine plus a little second harmonic).
@@ -144,13 +199,44 @@ const Note* notes_for(Sound s) {
     case Sound::Ring: return RING;
     case Sound::Shutdown: return SHUTDOWN;
     case Sound::Listen: return LISTEN;
+    case Sound::Claim: return TICK;  // played by render_claim()
   }
   return TICK;
 }
 
-void write_samples(const int16_t* data, size_t count) {
+void write_raw(const int16_t* data, size_t count) {  // 48 kHz
   size_t written;
   i2s_channel_write(tx, data, count * sizeof(int16_t), &written, pdMS_TO_TICKS(500));
+}
+
+void write_samples(const int16_t* data, size_t count) {  // 16 kHz
+  static int16_t out[CHUNK * RATIO];
+  for (size_t i = 0; i < count; i += CHUNK) {
+    const size_t m = min(CHUNK, count - i);
+    interpolate(data + i, m, out);
+    write_raw(out, m * RATIO);
+  }
+}
+
+// The claim tone: CLAIM_HZ for CLAIM_MS with soft edges (no click), at full level whatever the volume.
+volatile uint32_t claiming_until = 0;  // the capture task ignores what it hears of our own tone
+
+void render_claim() {
+  static int16_t buf[CHUNK * RATIO];
+  const uint32_t total = HW_RATE * CLAIM_MS / 1000, ramp = HW_RATE * 8 / 1000;
+  const float w = 2.0f * PI * CLAIM_HZ / HW_RATE;
+  claiming_until = millis() + CLAIM_MS + 120;
+  wr(0x32, 0xBF);  // DAC at 0 dB for the tone
+  for (uint32_t i = 0; i < total;) {
+    const size_t m = min<uint32_t>(CHUNK * RATIO, total - i);
+    for (size_t k = 0; k < m; k++, i++) {
+      const uint32_t edge = min(i, total - 1 - i);
+      const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
+      buf[k] = static_cast<int16_t>(23000.0f * env * sinf(w * i));
+    }
+    write_raw(buf, m);
+  }
+  claiming_until = millis() + 120;  // what's still in the DMA buffers, and the echo
 }
 
 void render(const Note* notes) {
@@ -225,6 +311,14 @@ void play_task(void*) {
   for (;;) {
     Sound s;
     if (xQueueReceive(queue, &s, speech_on ? 0 : pdMS_TO_TICKS(AMP_OFF_AFTER_MS)) == pdTRUE) {
+      if (s == Sound::Claim) {  // inaudible: played whatever the volume
+        sound_playing = true;
+        amp(true);
+        render_claim();
+        apply_volume();
+        sound_playing = false;
+        continue;
+      }
       if (current_volume <= 0) continue;
       sound_playing = true;
       amp(true);
@@ -268,10 +362,17 @@ constexpr float SPEECH_RATIO = 3.0f;
 constexpr float MIN_SPEECH_LEVEL = 250.0f;  // mean absolute amplitude, out of 32767
 float noise_floor = 200.0f;
 
+// The level of each chunk over the last 1.5 s, for recentLevelDb().
+constexpr size_t LEVELS = SAMPLE_RATE * 3 / 2 / CHUNK;
+uint16_t levels[LEVELS];
+size_t level_at = 0;
+
 bool is_speech(const int16_t* s, size_t n) {
   float sum = 0;
   for (size_t i = 0; i < n; i++) sum += abs(s[i]);
   const float level = sum / n;
+  levels[level_at] = static_cast<uint16_t>(level);
+  level_at = (level_at + 1) % LEVELS;
   const bool speech = level > noise_floor * SPEECH_RATIO && level > MIN_SPEECH_LEVEL;
   if (level < noise_floor) noise_floor += (level - noise_floor) * 0.1f;
   else if (!speech) noise_floor += (level - noise_floor) * 0.01f;
@@ -279,12 +380,62 @@ bool is_speech(const int16_t* s, size_t n) {
   return speech;
 }
 
+// Listening for other speakers' claim tones in the 48 kHz audio: Goertzel filters at the tone and at a reference
+// frequency below it, over 10 ms blocks. A tone is heard when it's well above the reference (broadband noise) and
+// a minimum level for 3 blocks in a row.
+constexpr int TONE_BLOCK = HW_RATE / 100;
+constexpr int REF_HZ = 17000;
+constexpr float TONE_MIN_AMP = 30.0f;  // out of 32767
+constexpr float TONE_OVER_REF = 4.0f;
+constexpr int TONE_BLOCKS = 3;
+volatile uint32_t claim_heard_at = 0;
+volatile int claim_peak = 0;
+
+struct Goertzel {
+  float coeff, s1 = 0, s2 = 0;
+  explicit Goertzel(float hz) : coeff(2.0f * cosf(2.0f * PI * hz / HW_RATE)) {}
+  void add(float x) {
+    const float s0 = x + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  float amplitude() {  // of a sine at this frequency over the block, then start over
+    const float power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    s1 = s2 = 0;
+    return 2.0f * sqrtf(max(power, 0.0f)) / TONE_BLOCK;
+  }
+};
+
+void listen_for_claims(const int16_t* raw, size_t n) {
+  static Goertzel tone(CLAIM_HZ), ref(REF_HZ);
+  static int count = 0, run = 0;
+  for (size_t i = 0; i < n; i++) {
+    tone.add(raw[i]);
+    ref.add(raw[i]);
+    if (++count < TONE_BLOCK) continue;
+    count = 0;
+    const float t = tone.amplitude(), r = ref.amplitude();
+    const bool ours = static_cast<int32_t>(claiming_until - millis()) > 0;
+    if (!ours && t > TONE_MIN_AMP && t > TONE_OVER_REF * r) {
+      if (t > claim_peak) claim_peak = static_cast<int>(t);
+      if (++run == TONE_BLOCKS) claim_heard_at = millis() | 1;  // never 0
+    } else {
+      run = 0;
+    }
+  }
+}
+
 void capture_task(void*) {
+  static int16_t raw[CHUNK * RATIO];
   static int16_t buf[CHUNK];
   for (;;) {
-    size_t got = 0;
-    if (i2s_channel_read(rx, buf, sizeof(buf), &got, pdMS_TO_TICKS(200)) != ESP_OK || !got) continue;
-    const size_t n = got / sizeof(int16_t);
+    size_t got_raw = 0;
+    if (i2s_channel_read(rx, raw, sizeof(raw), &got_raw, pdMS_TO_TICKS(200)) != ESP_OK || !got_raw) continue;
+    const size_t n_raw = got_raw / sizeof(int16_t) / RATIO * RATIO;
+    if (!mic_muted) listen_for_claims(raw, n_raw);
+    decimate(raw, n_raw, buf);
+    const size_t n = n_raw / RATIO;
+    const size_t got = n * sizeof(int16_t);
     const bool speech = !mic_muted && is_speech(buf, n);
     if (!listen_on && !mic_muted) wakeword::feed(buf, n);  // between sessions, the wake word listens
     xSemaphoreTake(rec_mutex, portMAX_DELAY);
@@ -333,6 +484,7 @@ bool begin() {
     LOGE(TAG, "out of memory for audio buffers");
     return false;
   }
+  fir_init();
   // I2S first: the codec needs MCLK running to accept its configuration.
   if (!i2s_init()) {
     LOGE(TAG, "I2S init failed");
@@ -347,7 +499,7 @@ bool begin() {
   xTaskCreatePinnedToCore(play_task, "audio_out", 4096, nullptr, 5, nullptr, 1);
   xTaskCreatePinnedToCore(capture_task, "audio_in", 4096, nullptr, 5, nullptr, 1);
   ok = true;
-  LOGI(TAG, "ES8311 ready, %d Hz", SAMPLE_RATE);
+  LOGI(TAG, "ES8311 ready, %d Hz (%d Hz to and from the codec)", SAMPLE_RATE, HW_RATE);
   return true;
 }
 
@@ -374,6 +526,7 @@ uint32_t soundMs(Sound sound) {
     f.close();
     return ms;
   }
+  if (sound == Sound::Claim) return CLAIM_MS;
   uint32_t ms = 0;
   for (const Note* n = notes_for(sound); n->ms; n++) ms += n->ms;
   return ms;
@@ -490,5 +643,19 @@ void stopSpeech() {
 }
 
 bool speaking() { return speech_on; }
+
+uint32_t claimHeardAt() { return claim_heard_at; }
+
+int claimLevel() {
+  const int peak = claim_peak;
+  claim_peak = 0;
+  return peak;
+}
+
+int recentLevelDb() {
+  uint16_t loudest = 1;
+  for (uint16_t l : levels) loudest = max(loudest, l);
+  return static_cast<int>(lroundf(20.0f * log10f(loudest / 32767.0f)));
+}
 
 }  // namespace audio

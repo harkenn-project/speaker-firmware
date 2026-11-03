@@ -1,16 +1,19 @@
-// Audio: ES8311 codec on I2S (16 kHz, 16-bit mono both ways), speaker amp on GPIO46.
+// Audio: ES8311 codec on I2S, speaker amp on GPIO46. The codec runs at 48 kHz so the speakers can signal each other
+// above hearing (wake word arbitration, below); everything else here is 16 kHz, 16-bit mono, filtered to and from it.
 // Playback and capture each run in their own task; every function here is safe to call from any task.
 #pragma once
 #include <Arduino.h>
 
 namespace audio {
 
-constexpr int SAMPLE_RATE = 16000;
+constexpr int SAMPLE_RATE = 16000;  // what goes in and out of this module
+constexpr int HW_RATE = 48000;      // what the codec runs at
 
 // Sounds. Boot, Activate, Done, Error and Shutdown are the sound pack's slots (boot, wake, done, error, shutdown):
 // a clip from Harkenn if one is stored (an empty clip is silence), else synthesized on the speaker like the rest.
 enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOff, Tick, Ring, Shutdown,
-                             Listen };  // Listen: a soft cue when it listens for a reply
+                             Listen,   // a soft cue when it listens for a reply
+                             Claim };  // the inaudible tone (below), at full level whatever the volume
 
 bool begin();  // false if the codec doesn't answer
 
@@ -56,5 +59,14 @@ size_t writeSpeech(const uint8_t* pcm, size_t bytes);  // returns bytes accepted
 void endSpeech();
 void stopSpeech();
 bool speaking();
+
+// Wake word arbitration (app.cpp). When several speakers hear the wake word, the one that heard it loudest plays
+// the Claim tone first (CLAIM_HZ, above hearing); the others hear it and stay quiet.
+constexpr int CLAIM_HZ = 19000;
+constexpr uint32_t CLAIM_MS = 80;
+uint32_t claimHeardAt();  // millis() when another speaker's tone was last heard; 0 if never
+int claimLevel();         // how strong the strongest tone heard since the last call was (amplitude, out of 32767)
+// The loudest 100 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
+int recentLevelDb();
 
 }  // namespace audio
