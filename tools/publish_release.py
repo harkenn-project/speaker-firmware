@@ -3,7 +3,12 @@
     python tools/publish_release.py [firmware.bin] [--channel=stable|beta|alpha|development] [--push] [--trailer=TEXT]
 
 Copies the built image (default .pio/build/harkenn-speaker/firmware.bin) to v<version>/firmware.bin on the
-`releases` branch, points the channel's manifest at it and commits; --push also pushes the branch. The version and
+`releases` branch, points the channel's manifest at it and commits; --push also pushes the branch.
+
+It also publishes the complete flash image PlatformIO builds next to it (firmware.factory.bin: bootloader,
+partition table and app, written at 0x0) as v<version>/harkenn-speaker-<version>-install.bin, for a first install
+over USB (see the README). A stable release also becomes install/harkenn-speaker.bin, a link that always gives the
+newest stable install image. The version and
 board are read from the image's HARKENN-FW marker (src/main.cpp), so bump FW_VERSION in platformio.ini first.
 
 Channels and their manifests: stable latest.json, beta latest-beta.json, alpha latest-alpha.json, development
@@ -24,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMAGE = ROOT / ".pio/build/harkenn-speaker/firmware.bin"
+APP_OFFSET = 0x10000  # where the app sits in the install image (partitions.csv)
 WORKTREE = ROOT / ".releases"
 BRANCH = "releases"
 CHANNELS = ("stable", "beta", "alpha", "development")
@@ -56,6 +62,17 @@ def inspect(data: bytes) -> tuple[str, str]:
     if not m:
         sys.exit("no HARKENN-FW marker: not Harkenn speaker firmware")
     return m.group(1).decode(), m.group(2).decode()
+
+
+def install_image(app_path: Path, app: bytes) -> bytes | None:
+    """The complete flash image built with this app, if it's there and really contains this app."""
+    factory = app_path.with_name("firmware.factory.bin")
+    if not factory.is_file():
+        return None
+    data = factory.read_bytes()
+    if data[:1] != b"\xe9" or data[APP_OFFSET:APP_OFFSET + len(app)] != app:
+        sys.exit(f"{factory} doesn't contain {app_path}: rebuild before publishing")
+    return data
 
 
 def worktree() -> Path:
@@ -100,8 +117,23 @@ def main() -> None:
     target.write_bytes(data)
     manifest = {"version": version, "hardware": hardware, "file": f"v{version}/firmware.bin", "size": len(data),
                 "sha256": hashlib.sha256(data).hexdigest()}
+    paths = [manifest_path.name, str(target.relative_to(wt))]
+    full = install_image(image, data)
+    if full is None:
+        print("note: no firmware.factory.bin next to the image, so no install image this time")
+    else:
+        install = target.parent / f"harkenn-speaker-{version}-install.bin"
+        install.write_bytes(full)
+        manifest["install"] = {"file": str(install.relative_to(wt)).replace("\\", "/"), "size": len(full),
+                               "sha256": hashlib.sha256(full).hexdigest()}
+        paths.append(str(install.relative_to(wt)))
+        if channel == "stable":
+            latest = wt / "install" / "harkenn-speaker.bin"
+            latest.parent.mkdir(exist_ok=True)
+            latest.write_bytes(full)
+            paths.append(str(latest.relative_to(wt)))
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    git("add", manifest_path.name, str(target.relative_to(wt)), cwd=wt)
+    git("add", *paths, cwd=wt)
     trailers = [f"--trailer={a[10:]}" for a in sys.argv[1:] if a.startswith("--trailer=")]
     git("commit", "-q", "-m", f"Firmware {version} ({channel})", *trailers, cwd=wt)
     print(f"committed firmware {version} ({len(data)} bytes, {hardware}) on {BRANCH}, channel {channel}")
