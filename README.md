@@ -52,13 +52,18 @@ supported.
    until you stop talking (Harkenn decides when, after `audio.silence_s` of silence) or tap again. Harkenn answers
    with speech, which the speaker plays while the character talks; a tap stops it. When the assistant asks
    something, the speaker plays a soft cue and listens for the answer without the wake word.
-9. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
+9. **Timers and alarms.** They live on the speaker (src/timers.cpp), saved so they survive restarts and ring on time
+   without Harkenn. Ringing shows a shaking bell with Stop and Snooze and stops on a tap, the wake word, "stop" (a
+   small second model from Harkenn, listening only while ringing) or after 5 minutes (timers) / 15 (alarms). A
+   countdown ring shows when a timer starts, and the status row at the top keeps an icon and the next timer's time
+   left. Notifications from Harkenn drop in as a card; an envelope stays until it's tapped.
+10. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
    home screen until it's dismissed or times out; tapping an area sends its label back as the next turn.
-10. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
+11. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
    taps to answer.
-11. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
+12. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
    wins over the config unless the volume in the config changes.
-12. **BOOT button.**
+13. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).
     - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).
