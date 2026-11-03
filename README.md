@@ -61,7 +61,7 @@ static IP), set the server address, log level, volume and brightness, ask Harken
 `firmware.bin`, restart, and factory reset.
 
 - **Passwords.** It takes the Harkenn admin password or the speaker's own password, which Harkenn makes at adoption
-  (shown once) and can change on the speaker's page in Harkenn. The speaker keeps only salted hashes of both. The
+  and shows on the speaker's page in Harkenn, where it can be changed. The speaker keeps only salted hashes of both. The
   hotspot's Wi-Fi password is the speaker password too. A speaker that isn't adopted yet has no passwords, so its page
   is open for the first-time setup.
 - **Lockout.** After 3 wrong passwords it waits 30 s, doubling every other try; after 10 it locks until it's unlocked
