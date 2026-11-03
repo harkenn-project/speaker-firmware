@@ -132,11 +132,18 @@ bool body(JsonDocument& doc) {
   return true;
 }
 
-// Local changes: kept until Harkenn acknowledges them (app.cpp sends them).
+constexpr size_t MAX_REMOVED = 16;  // network names removed here, remembered until Harkenn has them
+
+// Local changes: kept until Harkenn acknowledges them (app.cpp sends them). The lists are capped, so a speaker that
+// never reaches Harkenn can't outgrow its NVS: added networks to the saved list's size (newest first), removed names
+// to the newest MAX_REMOVED.
 void record(const std::function<void(JsonObject)>& edit) {
   JsonDocument doc;
   if (deserializeJson(doc, store::localChanges()) || !doc.is<JsonObject>()) doc.to<JsonObject>();
   edit(doc.as<JsonObject>());
+  JsonArray added = doc["wifi"].as<JsonArray>(), removed = doc["wifi_removed"].as<JsonArray>();
+  while (added.size() > store::MAX_WIFI) added.remove(added.size() - 1);
+  while (removed.size() > MAX_REMOVED) removed.remove(0);
   String out;
   serializeJson(doc, out);
   store::setLocalChanges(out);
