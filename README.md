@@ -43,17 +43,22 @@ supported.
    two a fixed 50 ms apart (so a stray tone can't pass for one), the third later the quieter the speaker heard the
    word. Strongest wins: the others stay quiet, or stop if they'd started (Harkenn's `audio.wake_arbitration`, on by
    default). The codec runs at 48 kHz for this, filtered to 16 kHz for everything else.
-7. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
+7. **Away from home.** Set up for remote connection (in Harkenn), a speaker that can't find Harkenn for 2 minutes
+   goes through the relay instead (see [RELAY.md](https://github.com/harkenn-project/server-docker/blob/main/docs/RELAY.md)):
+   the same conversation, end-to-end encrypted so the relay can't read it, with animations, sounds and firmware
+   coming through it too. A remote icon shows meanwhile; every 5 minutes it tries Harkenn directly and goes back
+   when that works.
+8. **Talking.** Say the wake word or tap the middle: the wake sound plays, then it streams what it hears to Harkenn
    until you stop talking (Harkenn decides when, after `audio.silence_s` of silence) or tap again. Harkenn answers
    with speech, which the speaker plays while the character talks; a tap stops it. When the assistant asks
    something, the speaker plays a soft cue and listens for the answer without the wake word.
-8. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
+9. **Screens.** Along with an answer, Harkenn can send a picture (maybe animated) with tappable areas. It covers the
    home screen until it's dismissed or times out; tapping an area sends its label back as the next turn.
-9. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
+10. **Ringing.** An agent can ring the speaker: the character's ringing animation and a ring every 3 s, until someone
    taps to answer.
-10. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
+11. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
    wins over the config unless the volume in the config changes.
-11. **BOOT button.**
+12. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).
     - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).
@@ -78,6 +83,12 @@ static IP), set the server address, log level, volume and brightness, ask Harken
 The page is plain HTTP: the speaker doesn't have the memory for HTTPS next to everything else. On the hotspot the Wi-Fi
 link itself is encrypted (WPA2).
 
+## Install
+
+The easiest way: open [flash.mylife.ninja](https://flash.mylife.ninja) in Chrome or Edge, plug the speaker in and
+follow the page ([harkenn-project/flash](https://github.com/harkenn-project/flash)). It checks the board (an ESP32-S3
+with 8 MB of PSRAM and 16 MB of flash) before writing anything.
+
 ## Build and flash
 
 ```
@@ -91,13 +102,16 @@ python -m venv .venv
 
 ## Updates
 
-After the first USB flash, update over Wi-Fi: upload `.pio/build/harkenn-speaker/firmware.bin` on Harkenn's
+After the first install, update over Wi-Fi: upload `.pio/build/harkenn-speaker/firmware.bin` on Harkenn's
 *Firmware* page and press *Install*. The speaker downloads it, checks the SHA-256, writes the spare app slot and
 restarts; the previous version stays in the other slot. Bump `FW_VERSION` in `platformio.ini` for every build
-you upload (Harkenn reads it from the image).
+you upload (Harkenn reads it from the image). The speaker's own page can take a `firmware.bin` upload too, for a
+speaker that can't reach Harkenn.
 
 **Releases.** Published releases live on this repo's `releases` branch as `latest.json` (and one manifest per
-pre-release channel) plus `v<version>/firmware.bin`. After building a new `FW_VERSION`:
+pre-release channel) plus `v<version>/firmware.bin`, and the complete install image the web flasher writes,
+`v<version>/harkenn-speaker-<version>-install.bin` (bootloader, partition table and app; a stable release is also
+`install/harkenn-speaker.bin`). After building a new `FW_VERSION`:
 
 ```
 python tools/publish_release.py --push
@@ -128,9 +142,11 @@ To restore the stock XiaoZhi firmware, write the full backup back to address 0 w
 
 ## Notes
 
-- `src/ca_certs.h` holds the Let's Encrypt roots (ISRG Root X1 and X2) used to verify the server.
-- Internal RAM is tight: each TLS connection needs tens of KB of it. The wake word's tensor arena and other large
-  buffers live in PSRAM, and screens arrive over the WebSocket rather than a second HTTPS download.
+- `src/ca_certs.h` holds the root certificates used to verify https: Let's Encrypt (ISRG Root X1 and X2) for
+  servers, and Google Trust Services and SSL.com for the relay behind Cloudflare.
+- Internal RAM is tight. TLS allocates in PSRAM (main.cpp), as do the wake word's tensor arena and stack and other
+  large buffers; screens arrive over the WebSocket rather than a second HTTPS download. The status sent to Harkenn
+  includes free internal RAM, its largest block and each task's unused stack.
 - `lib/tflm` and `lib/esp-nn` are vendored by `tools/vendor_tflm.py`.
 - If the picture comes out rotated or mirrored, change `DISPLAY_ROTATION` in `src/board.cpp`. Values 4-7 are the
   mirrored variants.

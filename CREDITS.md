@@ -7,7 +7,7 @@ The Harkenn speaker firmware is built on these projects. Thank you to all of the
 | Project | Used for | Licence |
 |---|---|---|
 | [Arduino core for ESP32](https://github.com/espressif/arduino-esp32) (Espressif), via the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform | Framework: Wi-Fi, HTTP, NVS, mDNS, OTA | LGPL-2.1 |
-| [ESP-IDF](https://github.com/espressif/esp-idf) (Espressif), including FreeRTOS, lwIP and Mbed TLS | Underlying SDK: I2S, stream buffers, TLS, SHA-256 | Apache-2.0 (FreeRTOS: MIT; lwIP: BSD-3-Clause) |
+| [ESP-IDF](https://github.com/espressif/esp-idf) (Espressif), including FreeRTOS, lwIP and Mbed TLS | Underlying SDK: I2S, stream buffers, TLS, SHA-256, the web page's PBKDF2 and the relay's AES-GCM | Apache-2.0 (FreeRTOS: MIT; lwIP: BSD-3-Clause) |
 | [LVGL](https://github.com/lvgl/lvgl) | Screen UI | MIT |
 | [Montserrat](https://github.com/JulietaUla/Montserrat) (bundled with LVGL) | Font | SIL OFL 1.1 |
 | [LovyanGFX](https://github.com/lovyan03/LovyanGFX) | Display (GC9A01) and touch (CST816) drivers | MIT and BSD-2-Clause |
@@ -19,7 +19,7 @@ The Harkenn speaker firmware is built on these projects. Thank you to all of the
 | [esp-nn](https://github.com/espressif/esp-nn) (Espressif, in `lib/esp-nn`) | ESP32-S3 vector kernels for the model | Apache-2.0 |
 | [FlatBuffers](https://github.com/google/flatbuffers), [gemmlowp](https://github.com/google/gemmlowp), [ruy](https://github.com/google/ruy) (Google), bundled with esp-tflite-micro | Model format and maths helpers for TFLM | Apache-2.0 |
 | [microWakeWord](https://github.com/kahrendt/microWakeWord) (Kevin Ahrendt) | The wake word models' design and feature settings the speaker follows; the models themselves come from Harkenn | Apache-2.0 |
-| [ISRG Root X1 and X2](https://letsencrypt.org/certificates/) (Let's Encrypt) | Root certificates in `src/ca_certs.h`, for servers on https | public |
+| [ISRG Root X1 and X2](https://letsencrypt.org/certificates/) (Let's Encrypt), [GTS Root R1, R3, R4](https://pki.goog/repository/) (Google Trust Services), [SSL.com Root CAs](https://www.ssl.com/repository/) (RSA, ECC) | Root certificates in `src/ca_certs.h`, for servers on https and the relay behind Cloudflare | public |
 
 The firmware's full source is in this repository, so the LGPL libraries can be rebuilt and relinked from it.
 

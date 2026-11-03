@@ -18,7 +18,7 @@ constexpr size_t MAX_WIFI = 8;
 
 void begin();
 
-// The server's address: entered on the setup page, or the one the speaker was adopted through. Empty: the speaker
+// The server's address: entered on the web page, or the one the speaker was adopted through. Empty: the speaker
 // looks for its server (app.cpp). Setting an empty string forgets it.
 String serverUrl();
 void setServerUrl(const String& url);
@@ -53,7 +53,7 @@ String takeUpdatedFrom();  // empty if there was no update
 String dismissedUpdate();
 void setDismissedUpdate(const String& version);
 
-// Ask for the Wi-Fi setup portal on the next boot (saved networks are kept).
+// Ask for the hotspot and web page on the next boot (Wi-Fi setup from the button; saved networks are kept).
 void requestPortal();
 bool takePortalRequest();  // true once after requestPortal()
 
