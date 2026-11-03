@@ -16,6 +16,7 @@
 #include <sys/time.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "board.h"
 #include "ca_certs.h"
 #include "logbuf.h"
+#include "relay.h"
 #include "store.h"
 #include "ui.h"
 #include "wakeword.h"
@@ -102,6 +104,101 @@ bool want_config = false;
 uint32_t last_status = 0, last_log_flush = 0;
 String play_state_restore;
 uint32_t play_state_until = 0;
+
+// Through the relay (relay.cpp; docs/RELAY.md in server-docker): when Harkenn can't be reached directly, the same
+// conversation goes, encrypted, through a relay both sides connect out to.
+constexpr uint32_t RELAY_AFTER_MS = 120000;   // can't find Harkenn this long (with Wi-Fi): try the relay
+constexpr uint32_t DIRECT_RETRY_MS = 300000;  // on the relay: try Harkenn directly this often
+constexpr uint32_t FETCH_IDLE_MS = 20000;     // a fetch through the relay gives up after this long without data
+constexpr uint32_t RELAY_GIVE_UP_MS = 90000;  // Harkenn looks for its speakers at the relay every 15 s
+enum class RelayState { Off, Waiting, Confirming, Ready };
+RelayState relay_state = RelayState::Off;
+bool via_relay = false;  // this connection is through the relay
+uint8_t* seal_buf = nullptr;
+size_t seal_cap = 0;
+
+// Sends a frame of the device protocol: as is, or sealed for the relay.
+bool send_frame(char kind, const uint8_t* data, size_t len) {
+  if (!via_relay) {
+    return kind == 'T' ? ws.sendTXT(const_cast<uint8_t*>(data), len) : ws.sendBIN(data, len);
+  }
+  if (!relay::ready()) return false;
+  if (seal_cap < len + relay::OVERHEAD) {
+    void* grown = heap_caps_realloc(seal_buf, len + relay::OVERHEAD, MALLOC_CAP_SPIRAM);
+    if (!grown) return false;
+    seal_buf = static_cast<uint8_t*>(grown);
+    seal_cap = len + relay::OVERHEAD;
+  }
+  const size_t n = relay::seal(kind, data, len, seal_buf);
+  return n && ws.sendBIN(seal_buf, n);
+}
+
+bool send_text(const String& text) {
+  return send_frame('T', reinterpret_cast<const uint8_t*>(text.c_str()), text.length());
+}
+
+// A file through the relay, instead of downloading it: Harkenn answers fetch with fetch_result, then the data in
+// 'F' frames, which go to the sink as they come (with the total size).
+using FetchSink = std::function<bool(const uint8_t* data, size_t len, size_t total)>;
+struct Fetch {
+  uint32_t id = 0;
+  int status = 0;  // 0 until fetch_result
+  size_t size = 0, got = 0, max = 0;
+  bool failed = false;
+  FetchSink sink;
+};
+Fetch fetching;
+uint32_t fetch_seq = 0;
+
+void fetch_result(JsonDocument& doc) {
+  if ((doc["id"] | 0u) != fetching.id) return;
+  fetching.status = doc["status"] | 500;
+  fetching.size = doc["size"] | 0;
+  if (fetching.size > fetching.max) fetching.failed = true;
+}
+
+void fetch_data(const uint8_t* data, size_t len) {
+  if (len < 4 || fetching.status != 200 || fetching.failed) return;
+  const uint32_t id = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+  if (id != fetching.id) return;
+  if (fetching.got + len - 4 > fetching.size || !fetching.sink(data + 4, len - 4, fetching.size)) {
+    fetching.failed = true;
+    return;
+  }
+  fetching.got += len - 4;
+}
+
+// Returns the HTTP-like status (200 with all the data), or -1 if the fetch failed or timed out.
+int relay_fetch(const String& url, size_t max, FetchSink sink) {
+  if (!via_relay || !ws_connected) return -1;
+  fetching = Fetch();
+  fetching.id = ++fetch_seq;
+  fetching.max = max;
+  fetching.sink = std::move(sink);
+  JsonDocument req;
+  req["type"] = "fetch";
+  req["id"] = fetching.id;
+  req["url"] = url;
+  String out;
+  serializeJson(req, out);
+  if (!send_text(out)) return -1;
+  uint32_t last = millis();
+  size_t seen = 0;
+  int status_seen = 0;
+  while (ws_connected && !fetching.failed && millis() - last < FETCH_IDLE_MS) {
+    ws.loop();
+    if (fetching.status && fetching.status != 200) return fetching.status;
+    if (fetching.status == 200 && fetching.got == fetching.size) return 200;
+    if (fetching.got != seen || fetching.status != status_seen) {  // progress
+      seen = fetching.got;
+      status_seen = fetching.status;
+      last = millis();
+    }
+    delay(1);
+  }
+  LOGW(TAG, "fetch through the relay failed: %s", url.c_str());
+  return -1;
+}
 
 // Touch, button and voice
 volatile bool tap_requested = false;
@@ -203,8 +300,65 @@ int request(const char* method, const String& path, const String& body, String* 
 
 // Downloads firmware into the spare app slot and checks its SHA-256. Returns an error message, or "" on success
 // (the slot is then the one to boot next).
+// Writes an image into the spare app slot as it comes, checking its SHA-256 and showing progress.
+struct ImageWriter {
+  const FirmwareUpdate& fw;
+  mbedtls_sha256_context sha;
+  size_t done = 0;
+  int shown = -1;
+  String error;
+
+  explicit ImageWriter(const FirmwareUpdate& f) : fw(f) {
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    if (!Update.begin(fw.size, U_FLASH)) error = String("can't start: ") + Update.errorString();
+  }
+  ~ImageWriter() { mbedtls_sha256_free(&sha); }
+
+  bool write(const uint8_t* data, size_t n) {
+    if (error.length()) return false;
+    if (done + n > fw.size || Update.write(const_cast<uint8_t*>(data), n) != n) {
+      error = String("flash write failed: ") + Update.errorString();
+      return false;
+    }
+    mbedtls_sha256_update(&sha, data, n);
+    done += n;
+    const int pct = done * 100 / fw.size;
+    if (pct / 2 != shown) {  // every 2%
+      shown = pct / 2;
+      char detail[48];
+      snprintf(detail, sizeof(detail), "%s  %d%%", fw.version.c_str(), pct);
+      ui::showProgress("Updating firmware", detail, pct);
+    }
+    return true;
+  }
+
+  // "" when the image is complete and checks out: it boots next.
+  String finish(String problem) {
+    if (!problem.length()) problem = error;
+    if (!problem.length() && done != fw.size) problem = "download interrupted";
+    uint8_t digest[32];
+    mbedtls_sha256_finish(&sha, digest);
+    char hex[65];
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    if (!problem.length() && fw.sha256 != hex) problem = "checksum mismatch";
+    if (problem.length()) {
+      Update.abort();
+      return problem;
+    }
+    return Update.end(true) ? String() : String("can't finish: ") + Update.errorString();
+  }
+};
+
 String install_firmware(const FirmwareUpdate& fw) {
   if (!fw.size || fw.sha256.length() != 64) return "bad update request";
+  if (via_relay) {  // through the relay: Harkenn sends the image itself
+    ImageWriter writer(fw);
+    const int status = relay_fetch(fw.url, fw.size, [&writer](const uint8_t* data, size_t len, size_t) {
+      return writer.write(data, len);
+    });
+    return writer.finish(status == 200 ? String() : "download failed: " + String(status));
+  }
   auto client = make_client(fw.url);
   HTTPClient http;
   http.setConnectTimeout(5000);
@@ -220,64 +374,51 @@ String install_firmware(const FirmwareUpdate& fw) {
     http.end();
     return "unexpected size " + String(http.getSize());
   }
-  if (!Update.begin(fw.size, U_FLASH)) {
+  ImageWriter writer(fw);
+  if (writer.error.length()) {
     http.end();
-    return String("can't start: ") + Update.errorString();
+    return writer.error;
   }
-  mbedtls_sha256_context sha;
-  mbedtls_sha256_init(&sha);
-  mbedtls_sha256_starts(&sha, 0);
   static uint8_t buf[4096];
   WiFiClient* stream = http.getStreamPtr();
-  size_t done = 0;
-  int shown = -1;
   uint32_t last_data = millis();
-  String error;
-  while (done < fw.size) {
+  String problem;
+  while (writer.done < fw.size) {
     const int avail = stream->available();
     if (avail <= 0) {
       if (!stream->connected() || millis() - last_data > 15000) {
-        error = "download interrupted";
+        problem = "download interrupted";
         break;
       }
       delay(2);
       continue;
     }
-    const size_t n = stream->readBytes(buf, min(sizeof(buf), min(static_cast<size_t>(avail), fw.size - done)));
-    if (Update.write(buf, n) != n) {
-      error = String("flash write failed: ") + Update.errorString();
-      break;
-    }
-    mbedtls_sha256_update(&sha, buf, n);
-    done += n;
+    const size_t n = stream->readBytes(buf, min(sizeof(buf), min(static_cast<size_t>(avail), fw.size - writer.done)));
+    if (!writer.write(buf, n)) break;
     last_data = millis();
-    const int pct = done * 100 / fw.size;
-    if (pct / 2 != shown) {  // every 2%
-      shown = pct / 2;
-      char detail[48];
-      snprintf(detail, sizeof(detail), "%s  %d%%", fw.version.c_str(), pct);
-      ui::showProgress("Updating firmware", detail, pct);
-    }
   }
   http.end();
-  uint8_t digest[32];
-  mbedtls_sha256_finish(&sha, digest);
-  mbedtls_sha256_free(&sha);
-  if (error.length()) {
-    Update.abort();
-    return error;
-  }
-  char hex[65];
-  for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
-  if (fw.sha256 != hex) {
-    Update.abort();
-    return "checksum mismatch";
-  }
-  if (!Update.end(true)) return String("can't finish: ") + Update.errorString();
-  return "";
+  return writer.finish(problem);
 }
 
 std::shared_ptr<ui::Blob> download(const String& url) {
+  if (via_relay) {  // through the relay: Harkenn sends it
+    auto blob = std::make_shared<ui::Blob>();
+    size_t at = 0;
+    const int status = relay_fetch(url, MAX_ASSET_BYTES, [&blob, &at](const uint8_t* data, size_t len, size_t total) {
+      if (!blob->data) {
+        blob->data = static_cast<uint8_t*>(heap_caps_malloc(total, MALLOC_CAP_SPIRAM));
+        blob->size = total;
+      }
+      if (!blob->data || at + len > blob->size) return false;
+      memcpy(blob->data + at, data, len);
+      at += len;
+      return true;
+    });
+    if (status == 200 && blob->data && at == blob->size) return blob;
+    LOGW(TAG, "download %s through the relay: %d", url.c_str(), status);
+    return nullptr;
+  }
   auto client = make_client(url);
   HTTPClient http;
   http.setConnectTimeout(5000);
@@ -448,9 +589,11 @@ bool ping_server() {
   return true;
 }
 
-bool find_server() {
+// Looks for Harkenn until it answers, Wi-Fi is lost, or `give_up_ms` have passed (0: never gives up).
+bool find_server(uint32_t give_up_ms = 0) {
   ui::showMessage("Looking for Harkenn", "On this network");
-  while (WiFi.status() == WL_CONNECTED) {
+  const uint32_t started = millis();
+  while (WiFi.status() == WL_CONNECTED && !(give_up_ms && millis() - started > give_up_ms)) {
     for (const String& url : server_candidates()) {
       server_url = url;
       server = parse_url(url);
@@ -613,6 +756,20 @@ void apply_local_access(JsonVariantConst la) {
   }
 }
 
+// Remote connection through the relay (config "remote"): its address and our credentials; null = not set up.
+void apply_remote(JsonVariantConst r) {
+  store::Remote next;
+  if (!r.isNull()) {
+    next.url = r["url"] | "";
+    next.id = r["id"] | "";
+    next.key = r["key"] | "";
+  }
+  const store::Remote old = store::remote();
+  if (next.url == old.url && next.id == old.id && next.key == old.key) return;
+  store::setRemote(next);
+  LOGI(TAG, next.url.length() ? "remote connection through the relay: on" : "remote connection: off");
+}
+
 void apply_config(JsonDocument& doc) {
   JsonObject cfg = doc["config"];
   JsonObject display = cfg["display"];
@@ -621,6 +778,7 @@ void apply_config(JsonDocument& doc) {
   if (deserializeJson(local, store::localChanges())) local.to<JsonObject>();
   strlcpy(device_name, doc["device"]["name"] | "", sizeof(device_name));
   apply_local_access(doc["local_access"]);
+  apply_remote(doc["remote"]);
 
   ui::Theme theme;
   JsonObject th = doc["theme"];
@@ -739,7 +897,7 @@ void apply_config(JsonDocument& doc) {
 void send_json(JsonDocument& doc) {
   String out;
   serializeJson(doc, out);
-  ws.sendTXT(out);
+  send_text(out);
 }
 
 // Internal RAM (free now, largest block, lowest since boot) and each task's stack never used, for sizing them.
@@ -774,6 +932,9 @@ void send_status() {
   s["brightness"] = brightness;
   s["config_version"] = config_version;
   s["local_failures"] = web::failures();
+  const store::Remote remote = store::remote();
+  if (remote.url.length()) s["remote"] = remote.id;  // Harkenn meets us at the relay once it knows we have it
+  s["via_relay"] = via_relay;
   s["local_locked"] = web::locked();
   s["hotspot"] = web::hotspotOn();
   send_json(doc);
@@ -784,7 +945,7 @@ void send_local_changes() {
   local_changes_due = false;
   const String changes = store::localChanges();
   if (!ws_connected || !changes.length()) return;
-  ws.sendTXT("{\"type\":\"local_changes\",\"id\":" + String(store::localChangesId()) + ",\"changes\":" + changes + "}");
+  send_text("{\"type\":\"local_changes\",\"id\":" + String(store::localChangesId()) + ",\"changes\":" + changes + "}");
   LOGI(TAG, "sent the changes made on the web page");
 }
 
@@ -883,7 +1044,7 @@ void start_voice() {
 void pump_mic() {
   static uint8_t buf[3200];  // 100 ms
   size_t n;
-  while ((n = audio::readMic(buf, sizeof(buf))) > 0) ws.sendBIN(buf, n);
+  while ((n = audio::readMic(buf, sizeof(buf))) > 0) send_frame('B', buf, n);
   if (audio::listening()) return;
   const audio::ListenInfo info = audio::listenInfo();
   if (audio::micMuted()) {  // muted mid-sentence: drop it
@@ -1169,7 +1330,9 @@ void handle_text(const uint8_t* payload, size_t len) {
     pending_config = "";
     pending_config.concat(reinterpret_cast<const char*>(payload), len);
   } else if (type == "ping") {
-    ws.sendTXT("{\"type\":\"pong\"}");
+    send_text("{\"type\":\"pong\"}");
+  } else if (type == "fetch_result") {
+    fetch_result(doc);
   } else if (type == "local_changes_ack") {
     store::clearLocalChanges(doc["id"] | 0);  // the config Harkenn sends next includes them
   } else if (type.startsWith("speak_") || type.startsWith("voice_") || type.startsWith("ring") ||
@@ -1259,43 +1422,100 @@ void handle_text(const uint8_t* payload, size_t len) {
   }
 }
 
+// Talking with Harkenn: directly, or through the relay once the handshake is done.
+void on_connected() {
+  ws_connected = true;
+  ws_down_since = 0;
+  first_ws_config = true;
+  local_changes_due = true;
+  LOGI(TAG, via_relay ? "connected to Harkenn through the relay" : "connected to Harkenn");
+  // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
+  esp_ota_mark_app_valid_cancel_rollback();
+  send_settings();  // in case the volume changed while offline
+  send_status();
+  if (!update_checked) {  // once per boot
+    update_checked = true;
+    send_text("{\"type\":\"update_check\"}");
+  }
+}
+
+void handle_binary(const uint8_t* payload, size_t len) {
+  if (receiving_screen) {  // a screen's picture
+    ui::Blob& b = *receiving_screen->image;
+    const size_t n = min(len, b.size - receiving_got);
+    memcpy(b.data + receiving_got, payload, n);
+    receiving_got += n;
+    if (receiving_got == b.size) pending_screen = std::move(receiving_screen);
+  } else if (voice == Voice::Speaking) {  // speech for the current reply
+    speech_dropped += len - audio::writeSpeech(payload, len);
+  }
+}
+
+// A binary frame from the relay: Harkenn's side of the handshake, then sealed frames.
+void relay_frame(uint8_t* payload, size_t len) {
+  if (relay_state == RelayState::Waiting) {
+    uint8_t answer[33];
+    if (relay::answer(payload, len, answer)) {
+      ws.sendBIN(answer, sizeof(answer));
+      relay_state = RelayState::Confirming;
+    }
+    return;
+  }
+  if (relay_state == RelayState::Confirming) {
+    if (!relay::confirm(payload, len)) {
+      LOGW(TAG, "relay: the other side doesn't have the key");
+      ws.disconnect();
+      return;
+    }
+    relay_state = RelayState::Ready;
+    JsonDocument hello;  // proves it's us, like the Authorization header of a direct connection
+    hello["type"] = "hello";
+    hello["token"] = token;
+    send_json(hello);
+    on_connected();
+    return;
+  }
+  char kind;
+  uint8_t* data;
+  size_t n;
+  if (relay_state != RelayState::Ready || !relay::open(payload, len, &kind, &data, &n)) {
+    LOGW(TAG, "relay: a frame that doesn't check out; starting over");
+    ws.disconnect();
+    return;
+  }
+  if (kind == 'T') handle_text(data, n);
+  else if (kind == 'B') handle_binary(data, n);
+  else if (kind == 'F') fetch_data(data, n);
+}
+
 void on_ws_event(WStype_t type, uint8_t* payload, size_t len) {
   switch (type) {
     case WStype_CONNECTED:
-      ws_connected = true;
-      ws_down_since = 0;
-      first_ws_config = true;
-      local_changes_due = true;
-      LOGI(TAG, "connected to Harkenn");
-      // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
-      esp_ota_mark_app_valid_cancel_rollback();
-      send_settings();  // in case the volume changed while offline
-      send_status();
-      if (!update_checked) {  // once per boot
-        update_checked = true;
-        ws.sendTXT("{\"type\":\"update_check\"}");
+      if (via_relay) {
+        relay_state = RelayState::Waiting;  // for Harkenn to come, then its HELLO
+        LOGI(TAG, "at the relay, waiting for Harkenn");
+      } else {
+        on_connected();
       }
       break;
     case WStype_DISCONNECTED:
       if (ws_connected) LOGW(TAG, "connection to Harkenn lost");
       ws_connected = false;
+      if (via_relay) {
+        relay_state = RelayState::Off;
+        relay::end();
+        relay::begin(store::remote().key);  // ready for the next try
+      }
       if (voice == Voice::Speaking) audio::endSpeech();  // play what arrived
       receiving_screen.reset();                           // a picture cut off halfway
       if (!ws_down_since) ws_down_since = millis();
       break;
     case WStype_TEXT:
-      handle_text(payload, len);
+      if (!via_relay) handle_text(payload, len);  // the relay's own text ("paired") needs nothing from us
       break;
     case WStype_BIN:
-      if (receiving_screen) {  // a screen's picture
-        ui::Blob& b = *receiving_screen->image;
-        const size_t n = min(len, b.size - receiving_got);
-        memcpy(b.data + receiving_got, payload, n);
-        receiving_got += n;
-        if (receiving_got == b.size) pending_screen = std::move(receiving_screen);
-      } else if (voice == Voice::Speaking) {  // speech for the current reply
-        speech_dropped += len - audio::writeSpeech(payload, len);
-      }
+      if (via_relay) relay_frame(payload, len);
+      else handle_binary(payload, len);
       break;
     default:
       break;
@@ -1309,8 +1529,10 @@ void run_firmware_update() {
   voice = Voice::Off;
   audio::stopListening();
   audio::stopSpeech();
-  ws.disconnect();
-  ws_connected = false;
+  if (!via_relay) {  // downloaded over HTTP; through the relay it comes on this connection
+    ws.disconnect();
+    ws_connected = false;
+  }
   ui::showProgress("Updating firmware", fw->version.c_str(), 0);
   const String error = install_firmware(*fw);
   if (error.length()) {
@@ -1342,24 +1564,65 @@ void update_sleep() {
 }
 
 // Returns false if the server rejected the token (re-adopt), true for anything else (start over).
-bool run_online() {
-  String body;
-  const int code = request("GET", "/api/v1/device/config", "", &body, true);
-  if (code == 401) return false;
-  if (code != 200) {
-    LOGW(TAG, "config: HTTP %d", code);
-    return true;
+// Harkenn answers directly at the saved addresses (a quick check while on the relay).
+bool direct_reachable() {
+  for (const String& url : {store::serverUrl(), store::announcedServerUrl()}) {
+    if (!url.length()) continue;
+    server_url = url;
+    server = parse_url(url);
+    if (ping_server()) return true;
   }
-  {
-    JsonDocument doc;
-    if (!deserializeJson(doc, body)) apply_config(doc);
-  }
+  return false;
+}
 
-  const String path = server.base + "/api/v1/device/ws";
-  if (server.secure) ws.beginSslWithCA(server.host.c_str(), server.port, path.c_str(), CA_PEM, "");
-  else ws.begin(server.host, server.port, path, "");
-  ws.setExtraHeaders(("Authorization: Bearer " + token).c_str());
+// Leaving relay mode, however run_online ends.
+struct RelayMode {
+  ~RelayMode() {
+    via_relay = false;
+    relay_state = RelayState::Off;
+    relay::end();
+    ui::setRemote(false);
+  }
+};
+
+// Returns false if the server rejected the token (re-adopt), true for anything else (start over). `use_relay`: the
+// same conversation through the relay, for a speaker set up for remote connection that can't reach Harkenn; it ends
+// when Harkenn is reachable directly again.
+bool run_online(bool use_relay = false) {
+  RelayMode relay_mode;
+  if (use_relay) {
+    const store::Remote remote = store::remote();
+    if (!remote.url.length() || !relay::begin(remote.key)) return true;
+    String url = remote.url;  // wss://host[:port][/base]
+    if (url.startsWith("wss://")) url = "https://" + url.substring(6);
+    else if (url.startsWith("ws://")) url = "http://" + url.substring(5);
+    const ServerUrl relay_url = parse_url(url);
+    const String path = relay_url.base + "/relay/speaker/" + remote.id;
+    via_relay = true;
+    ui::setRemote(true);
+    LOGI(TAG, "trying the relay at %s", remote.url.c_str());
+    if (relay_url.secure) ws.beginSslWithCA(relay_url.host.c_str(), relay_url.port, path.c_str(), CA_PEM, "");
+    else ws.begin(relay_url.host, relay_url.port, path, "");
+    ws.setExtraHeaders("");  // the token goes inside, where the relay can't see it
+  } else {
+    String body;
+    const int code = request("GET", "/api/v1/device/config", "", &body, true);
+    if (code == 401) return false;
+    if (code != 200) {
+      LOGW(TAG, "config: HTTP %d", code);
+      return true;
+    }
+    {
+      JsonDocument doc;
+      if (!deserializeJson(doc, body)) apply_config(doc);
+    }
+    const String path = server.base + "/api/v1/device/ws";
+    if (server.secure) ws.beginSslWithCA(server.host.c_str(), server.port, path.c_str(), CA_PEM, "");
+    else ws.begin(server.host, server.port, path, "");
+    ws.setExtraHeaders(("Authorization: Bearer " + token).c_str());
+  }
   ws.onEvent(on_ws_event);
+  uint32_t direct_checked = millis();
   ws.setReconnectInterval(5000);
   ws.enableHeartbeat(25000, 10000, 2);
   ws_connected = false;
@@ -1382,13 +1645,13 @@ bool run_online() {
     }
     if (want_config && ws_connected) {
       want_config = false;
-      ws.sendTXT("{\"type\":\"config_request\"}");
+      send_text("{\"type\":\"config_request\"}");
     }
     // asked for on the web page
     if (local_changes_due && ws_connected) send_local_changes();
     if (update_check_wanted && ws_connected) {
       update_check_wanted = false;
-      ws.sendTXT("{\"type\":\"update_check\"}");
+      send_text("{\"type\":\"update_check\"}");
     }
     if (wifi_changed) {
       wifi_changed = false;
@@ -1440,7 +1703,25 @@ bool run_online() {
       ws.disconnect();
       return true;
     }
-    if (!ws_connected && ws_down_since && millis() - ws_down_since > WS_GIVE_UP_MS) {
+    if (use_relay) {
+      if (!store::remote().url.length()) {  // remote connection was turned off
+        ws.disconnect();
+        return true;
+      }
+      // Every few minutes, while nothing's going on, see whether Harkenn can be reached directly again.
+      if (millis() - direct_checked > DIRECT_RETRY_MS && voice == Voice::Off && !ring_id.length()) {
+        direct_checked = millis();
+        if (direct_reachable()) {
+          LOGI(TAG, "Harkenn is reachable directly again: leaving the relay");
+          ws.disconnect();
+          return true;
+        }
+      }
+      if (!ws_connected && ws_down_since && millis() - ws_down_since > RELAY_GIVE_UP_MS) {
+        ws.disconnect();
+        return true;  // tries Harkenn directly, then the relay again
+      }
+    } else if (!ws_connected && ws_down_since && millis() - ws_down_since > WS_GIVE_UP_MS) {
       // The socket won't come back: check whether the token was revoked or the server is down.
       ws.disconnect();
       return request("GET", "/api/v1/device/config", "", nullptr, true) != 401;
@@ -1506,6 +1787,7 @@ void start_web() {
     s["hardware"] = HARDWARE_ID;
     s["adopted"] = token.length() > 0;
     s["connected"] = ws_connected;
+    s["via_relay"] = via_relay;
     s["server"] = server_url;
     s["ap_name"] = ap_name();
     s["ssid"] = WiFi.isConnected() ? WiFi.SSID() : String();
@@ -1589,7 +1871,16 @@ void main_task(void*) {
       connect_wifi(physical);
       physical = false;
     }
-    if (!find_server()) continue;
+    // Set up for remote connection (and adopted): after a while without Harkenn, go through the relay.
+    const bool remote = token.length() && store::remote().url.length();
+    if (!find_server(remote ? RELAY_AFTER_MS : 0)) {
+      if (remote && WiFi.status() == WL_CONNECTED) {
+        LOGI(TAG, "can't find Harkenn: trying the relay");
+        run_online(true);
+        delay(3000);
+      }
+      continue;
+    }
     if (!token.length() && !adopt()) continue;
     if (!run_online()) {
       LOGW(TAG, "the server no longer accepts this speaker's token; asking for adoption again");

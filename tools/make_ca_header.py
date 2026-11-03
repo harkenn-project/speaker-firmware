@@ -1,8 +1,10 @@
-"""Regenerate src/ca_certs.h from PEM files.
+"""Regenerate src/ca_certs.h from PEM files: the roots the speaker trusts for https.
 
-    curl -o x1.pem https://letsencrypt.org/certs/isrgrootx1.pem
-    curl -o x2.pem https://letsencrypt.org/certs/isrg-root-x2.pem
-    python tools/make_ca_header.py x1.pem x2.pem > src/ca_certs.h
+    python tools/make_ca_header.py isrg-x1.pem isrg-x2.pem gts-r1.pem gts-r3.pem gts-r4.pem sslcom-rsa.pem         sslcom-ecc.pem > src/ca_certs.h
+
+Let's Encrypt (ISRG Root X1, X2) for servers with its certificates, and the CAs Cloudflare issues its edge
+certificates from (Google Trust Services GTS Root R1, R3, R4; SSL.com RSA and ECC), for the relay behind Cloudflare.
+The PEMs come from the CAs' sites, or from Python's certifi bundle.
 """
 import sys
 
@@ -14,8 +16,8 @@ for path in sys.argv[1:]:
         lines += [line.strip() for line in f if line.strip()]
 
 out = [
-    "// Let's Encrypt root certificates (ISRG Root X1 RSA, ISRG Root X2 ECDSA), from https://letsencrypt.org/certificates/",
-    "// For servers reached over https with a Let's Encrypt certificate.",
+    "// Root certificates the speaker trusts for https: Let's Encrypt (ISRG Root X1, X2), and for the relay behind",
+    "// Cloudflare, Google Trust Services (GTS Root R1, R3, R4) and SSL.com (RSA, ECC).",
     "// Regenerate with tools/make_ca_header.py.",
     "#pragma once",
     "",

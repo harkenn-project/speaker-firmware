@@ -53,6 +53,8 @@ void identify();                       // blink the screen for a few seconds
 
 // Mic muted: while idle or sleeping, the character shows its muted animation and the ring turns orange.
 void setMuted(bool muted);
+// Connected through the relay (away from home): a small icon at the top of every screen.
+void setRemote(bool on);
 
 // "Update available vX" with Install / Dismiss on top of the home screen, until hidden. The buttons call the
 // callbacks (on the UI task, UI locked) and hide the prompt.

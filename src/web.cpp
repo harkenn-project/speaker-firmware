@@ -692,7 +692,7 @@ for(const b of $$("nav [data-tab]"))b.onclick=()=>{tab=b.dataset.tab;for(const x
 function up(s){const h=Math.floor(s/3600);return h?`${h} h ${Math.floor(s/60)%60} min`:`${Math.floor(s/60)} min`;}
 async function refresh(){
   status=await api("/api/status");const s=status;$("#name").textContent=s.name||"";
-  if(tab=="status")dl($("#status"),[["Name",s.name],["Harkenn",s.connected?`connected (${s.server})`:s.adopted?"not connected":"not adopted yet"],
+  if(tab=="status")dl($("#status"),[["Name",s.name],["Harkenn",s.connected?(s.via_relay?"connected remotely, through the relay":`connected (${s.server})`):s.adopted?"not connected":"not adopted yet"],
     ["Hotspot",s.hotspot?`on: ${s.ap_name}`:undefined],["Wi-Fi",s.ssid?`${s.ssid} (${s.rssi} dBm)`:"not connected"],["IP",s.ip],
     ["State",s.state],["Volume",`${s.volume}%${s.muted?", mic off":""}`],["Brightness",`${s.brightness}%`],
     ["Battery",s.battery!=null&&s.battery>=0?`${s.battery}%${s.charging?", charging":""}`:undefined],["Uptime",up(s.uptime_s)],

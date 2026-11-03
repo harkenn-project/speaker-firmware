@@ -239,6 +239,18 @@ void setLoginLocked(bool locked) {
   prefs.putBool("lk_perm", locked);
 }
 
+Remote remote() {
+  Lock l;
+  return Remote{get("relay_url", ""), get("relay_id", ""), get("relay_key", "")};
+}
+
+void setRemote(const Remote& r) {
+  Lock l;
+  put_or_remove("relay_url", r.url);
+  put_or_remove("relay_id", r.url.length() ? r.id : String());
+  put_or_remove("relay_key", r.url.length() ? r.key : String());
+}
+
 String localChanges() {
   Lock l;
   return get("local_chg", "");

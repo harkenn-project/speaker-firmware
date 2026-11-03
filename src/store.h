@@ -72,6 +72,14 @@ void setLoginFailures(uint8_t failures);
 bool loginLocked();
 void setLoginLocked(bool locked);
 
+// Remote connection through the relay, from Harkenn's config ("remote"): its address (wss://...), this speaker's
+// relay id and key (hex). Empty url = not set up for it.
+struct Remote {
+  String url, id, key;
+};
+Remote remote();
+void setRemote(const Remote& remote);
+
 // Settings changed on the web page that Harkenn hasn't confirmed yet, as JSON (wifi, wifi_removed, log_level,
 // brightness, server_url). They win over the config until Harkenn acknowledges them by id.
 String localChanges();

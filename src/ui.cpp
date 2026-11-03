@@ -627,6 +627,20 @@ void setMuted(bool m) {
   apply_state();
 }
 
+void setRemote(bool on) {
+  Lock l;
+  static lv_obj_t* icon = nullptr;  // on the top layer: it stays over every screen
+  if (!icon) {
+    icon = lv_label_create(lv_layer_top());
+    lv_label_set_text(icon, LV_SYMBOL_SHUFFLE);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(icon, color(0xffb547), 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
+  }
+  if (on) lv_obj_remove_flag(icon, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
+}
+
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)()) {
   Lock l;
   if (offer_panel) lv_obj_delete(offer_panel);
