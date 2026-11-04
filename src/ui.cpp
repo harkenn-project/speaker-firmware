@@ -237,6 +237,60 @@ lv_obj_t* reset_screen() {
 
 // A centred label in the box (x, y, w, h). Text never leaves the box: a one-line label is cut short with "...",
 // a multi-line label wraps and is clipped after `lines` lines. The text is vertically centred in the box.
+// The fonts have plain ASCII and LVGL's symbols only: anything else would show as a box. Accented letters become their
+// plain letter ("Gymnopédie" -> "Gymnopedie"), curly quotes and dashes straight ones, the symbols (U+F000-F8FF) stay,
+// and anything else unknown becomes "?".
+String plain(const char* text) {
+  String out;
+  if (!text) return out;
+  // U+00C0..U+017F, by code point: the letter without its accent ('?' where there isn't one)
+  static const char LATIN[] =
+      "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTs"  // C0-DF
+      "aaaaaaaceeeeiiiidnooooo/ouuuuyty"  // E0-FF
+      "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGg"  // 100-11F
+      "GgGgHhHhIiIiIiIiIiJjJjKkkLlLlLlL"  // 120-13F
+      "lLlNnNnNnnNnOoOoOoOoRrRrRrSsSsSs"  // 140-15F
+      "SsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";  // 160-17F
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(text);
+  while (*p) {
+    uint32_t c = *p;
+    int extra = c < 0x80 ? 0 : c < 0xE0 ? 1 : c < 0xF0 ? 2 : 3;
+    const uint8_t* start = p;
+    if (extra) c &= extra == 1 ? 0x1F : extra == 2 ? 0x0F : 0x07;
+    p++;
+    for (int i = 0; i < extra && (*p & 0xC0) == 0x80; i++) c = (c << 6) | (*p++ & 0x3F);
+    if (c < 0x80) out += static_cast<char>(c);
+    else if (c >= 0xF000 && c <= 0xF8FF) out.concat(reinterpret_cast<const char*>(start), p - start);  // a symbol
+    else if (c == 0xC6 || c == 0x152) out += "AE";
+    else if (c == 0xE6 || c == 0x153) out += "ae";
+    else if (c == 0xDF) out += "ss";
+    else if (c >= 0xC0 && c <= 0x17F) out += LATIN[c - 0xC0];
+    else if (c == 0x2018 || c == 0x2019 || c == 0x201A) out += '\'';
+    else if (c == 0x201C || c == 0x201D || c == 0x201E) out += '"';
+    else if (c == 0x2013 || c == 0x2014) out += '-';
+    else if (c == 0x2026) out += "...";
+    else if (c == 0xA0) out += ' ';
+    else if (c == 0xB7 || c == 0x2022) out += '-';
+    else out += '?';
+  }
+  return out;
+}
+
+void set_text(lv_obj_t* l, const char* text) { lv_label_set_text(l, plain(text).c_str()); }
+
+// A one-line label that scrolls left and right when its text doesn't fit (song names); centred when it does.
+lv_obj_t* scroll_label(lv_obj_t* parent, const lv_font_t* f, uint32_t rgb, int x, int y, int w) {
+  lv_obj_t* l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, f, 0);
+  lv_obj_set_style_text_color(l, color(rgb), 0);
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(l, LV_LABEL_LONG_SCROLL);  // back and forth: fixed height, one line
+  lv_obj_set_size(l, w, lv_font_get_line_height(f));
+  lv_obj_set_style_anim_duration(l, 0, 0);  // speed from the text's length (LVGL's default pace)
+  lv_obj_set_pos(l, x, y);
+  return l;
+}
+
 lv_obj_t* label(lv_obj_t* parent, const char* text, const lv_font_t* f, uint32_t rgb, int x, int y, int w, int h,
                 int lines = 1) {
   const int line_h = lv_font_get_line_height(f);
@@ -247,7 +301,7 @@ lv_obj_t* label(lv_obj_t* parent, const char* text, const lv_font_t* f, uint32_t
   lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_long_mode(l, lines == 1 ? LV_LABEL_LONG_DOT : LV_LABEL_LONG_WRAP);
   lv_obj_set_size(l, w, line_h * lines);
-  lv_label_set_text(l, text);
+  set_text(l, text);
   lv_obj_set_pos(l, x, y + max(0, (h - line_h * lines) / 2));
   return l;
 }
@@ -1260,9 +1314,9 @@ lv_obj_t* pill(lv_obj_t* parent, const char* icon, const char* name, const char*
   lv_obj_align(ic, LV_ALIGN_LEFT_MID, 0, 0);
   lv_obj_t* n = lv_label_create(b);
   lv_obj_set_style_text_font(n, &lv_font_montserrat_14, 0);
-  lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);  // one line, cut short with "...": needs a fixed height, or it wraps
+  lv_label_set_long_mode(n, LV_LABEL_LONG_SCROLL);  // one line, scrolling left and right when it doesn't fit
   lv_obj_set_size(n, detail && *detail ? 104 : 124, lv_font_get_line_height(&lv_font_montserrat_14));
-  lv_label_set_text(n, name);
+  set_text(n, name);
   lv_obj_set_style_text_color(n, color(theme.text), 0);
   lv_obj_align(n, LV_ALIGN_LEFT_MID, 24, 0);
   if (detail && *detail) {
@@ -1376,11 +1430,13 @@ void update_player() {
   String kind = n.kind == "soundscape" ? "SOUNDSCAPE" : n.kind == "meditation" ? "MEDITATION" : "MUSIC";
   if (n.kind == "music" && n.tracks > 1) kind += "  " + String(n.track + 1) + " / " + String(n.tracks);
   lv_label_set_text(p_kind, kind.c_str());
-  lv_label_set_text(p_title, n.active ? n.title.c_str() : "Stopped");
+  const String title = plain(n.active ? n.title.c_str() : "Stopped");
+  if (title != lv_label_get_text(p_title)) lv_label_set_text(p_title, title.c_str());  // same text: keeps scrolling
   String sub = n.kind == "music" ? n.album + "  " : String();
   sub += clock_text(n.elapsed_s);
   if (n.duration_s && n.kind != "soundscape") sub += " / " + clock_text(n.duration_s);
-  lv_label_set_text(p_sub, sub.c_str());
+  const String sub_text = plain(sub.c_str());
+  if (sub_text != lv_label_get_text(p_sub)) lv_label_set_text(p_sub, sub_text.c_str());
   lv_label_set_text(lv_obj_get_child(p_play, 0), n.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
   if (n.duration_s) {
     lv_obj_remove_flag(p_arc, LV_OBJ_FLAG_HIDDEN);
@@ -1417,8 +1473,8 @@ void build_player() {
   lv_obj_set_style_pad_all(p_arc, 0, LV_PART_KNOB);
 
   p_kind = label(media_panel, "", &lv_font_montserrat_14, theme.primary, 30, 30, 180, 18);
-  p_title = label(media_panel, "", &lv_font_montserrat_18, theme.text, 26, 50, 188, 44, 2);
-  p_sub = label(media_panel, "", &lv_font_montserrat_14, theme.muted, 30, 96, 180, 18);
+  p_title = scroll_label(media_panel, &lv_font_montserrat_18, theme.text, 26, 60, 188);
+  p_sub = scroll_label(media_panel, &lv_font_montserrat_14, theme.muted, 30, 92, 180);
   const bool album = media_now.kind == "music" && media_now.tracks > 1;
   if (album) {
     icon_button(media_panel, LV_SYMBOL_PREV, 40, 128, 44, false, [](lv_event_t*) { if (media_do.previous) media_do.previous(); });
