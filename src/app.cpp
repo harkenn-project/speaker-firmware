@@ -267,6 +267,7 @@ volatile bool local_changes_due = true;    // send local changes to Harkenn (at 
 volatile bool update_check_wanted = false;
 volatile bool factory_reset_wanted = false;  // Harkenn asked
 volatile bool card_rescan_wanted = false;  // Harkenn asked
+volatile bool card_format_wanted = false;  // Harkenn asked (admin only: it erases the card)
 uint32_t card_sent = UINT32_MAX;  // the card::version() Harkenn last heard about
 uint32_t media_sent = UINT32_MAX;  // the player::version() Harkenn last heard about
 char device_name[49] = "";
@@ -1834,6 +1835,8 @@ void handle_text(const uint8_t* payload, size_t len) {
       factory_reset_wanted = true;  // from the main loop
     } else if (command == "card_rescan") {
       card_rescan_wanted = true;  // from the main loop
+    } else if (command == "card_format") {
+      card_format_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
     } else if (command == "refresh_config") {
@@ -2123,6 +2126,13 @@ bool run_online(bool use_relay = false) {
       store::factoryReset();
       delay(1000);
       ESP.restart();
+    }
+    if (card_format_wanted) {
+      card_format_wanted = false;
+      player::stop();
+      delay(150);  // let it close its file
+      card::format();
+      send_status();
     }
     if (card_rescan_wanted) {
       card_rescan_wanted = false;
