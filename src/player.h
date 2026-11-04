@@ -32,6 +32,8 @@ void setRepeat(Repeat repeat);
 void sleepAfter(uint32_t minutes);  // fade out and stop then; 0 turns it off
 
 bool active();  // playing or paused
+// The file playing or paused ("/Music/Background/01 X.mp3"), or "": so a card sync never pulls it away.
+String playingPath();
 // Goes up on every change worth telling Harkenn about.
 uint32_t version();
 // {state: "playing"|"paused"|"stopped", kind, album, title, track, tracks, repeat, shuffle, sleep_s, error}

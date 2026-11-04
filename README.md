@@ -73,6 +73,10 @@ supported.
      no gap at all); a meditation plays once; a sleep timer fades out over 8 s;
    - it fades out while the speaker listens, talks or rings, and pause, stop and skip fade briefly, so nothing clicks;
    - Harkenn sends `media` commands and the speaker reports `media_state` (PROTOCOL.md §10, §11).
+   - The card is kept in step with Harkenn's media library (src/cardsync.cpp, PROTOCOL.md §12): Harkenn sends a plan
+     of every file it wants there; the speaker deletes only files on its own manifest (`/.harkenn/manifest.json`),
+     fetches what's missing a piece at a time over the WebSocket while idle, checks each SHA-256, and resumes after a
+     restart. Files copied onto the card some other way are never touched. The plan and the manifest live in PSRAM.
 14. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).

@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "board.h"
 #include "card.h"
+#include "cardsync.h"
 #include "player.h"
 #include "ca_certs.h"
 #include "logbuf.h"
@@ -1032,9 +1033,11 @@ void handle_media(JsonDocument& doc) {
 void send_card() {
   card_sent = card::version();
   if (!ws_connected) return;
-  JsonDocument doc;
+  JsonDocument doc(cardsync::psramAllocator());  // it lists Harkenn's files: can be long
   doc["type"] = "card";
-  card::catalogue(doc["card"].to<JsonObject>());
+  JsonObject c = doc["card"].to<JsonObject>();
+  card::catalogue(c);
+  cardsync::describe(c);
   send_json(doc);
 }
 
@@ -1752,6 +1755,12 @@ void flush_logs() {
 }
 
 void handle_text(const uint8_t* payload, size_t len) {
+  // A card plan can list hundreds of files: straight to cardsync, which keeps it in PSRAM.
+  static const char PLAN[] = "\"type\":\"card_plan\"";
+  if (len > sizeof(PLAN) && memmem(payload, min<size_t>(len, 40), PLAN, sizeof(PLAN) - 1)) {
+    cardsync::onPlan(reinterpret_cast<const char*>(payload), len);
+    return;
+  }
   JsonDocument doc;
   if (deserializeJson(doc, payload, len)) return;
   const String type = doc["type"] | "";
@@ -1764,6 +1773,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     handle_timer(doc);
   } else if (type == "media") {
     handle_media(doc);
+  } else if (type == "card_chunk") {
+    cardsync::onChunk(doc);
   } else if (type == "notify") {
     handle_notify(doc);
   } else if (type == "notifications_clear") {
@@ -1884,6 +1895,7 @@ void on_connected() {
 }
 
 void handle_binary(const uint8_t* payload, size_t len) {
+  if (cardsync::onBinary(payload, len)) return;  // a piece of a file for the SD card
   if (receiving_screen) {  // a screen's picture
     ui::Blob& b = *receiving_screen->image;
     const size_t n = min(len, b.size - receiving_got);
@@ -2129,6 +2141,7 @@ bool run_online(bool use_relay = false) {
     }
     if (card_format_wanted) {
       card_format_wanted = false;
+      cardsync::reset();  // drop any sync under way
       player::stop();
       delay(150);  // let it close its file
       card::format();
@@ -2136,6 +2149,7 @@ bool run_online(bool use_relay = false) {
     }
     if (card_rescan_wanted) {
       card_rescan_wanted = false;
+      cardsync::reset();
       player::stop();
       delay(150);  // let it close its file
       card::rescan();
@@ -2143,6 +2157,8 @@ bool run_online(bool use_relay = false) {
     }
     if (ws_connected && card_sent != card::version()) send_card();
     if (ws_connected && media_sent != player::version()) send_media();
+    // the SD card catches up with Harkenn's plan while the speaker's idle
+    cardsync::loop(voice == Voice::Off && !ring_id.length() && !timer_ringing(), ws_connected);
     // Music fades out while the speaker listens, talks or rings, and comes back after.
     audio::holdMusic(audio::HOLD_VOICE, voice != Voice::Off || ring_id.length() || timer_ringing());
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
@@ -2338,6 +2354,7 @@ void main_task(void*) {
   ui::showMessage("Starting", ap_name().c_str());
   card::begin();
   player::begin();
+  cardsync::begin([](JsonDocument& doc) { send_json(doc); });
   board::setBrightness(brightness);
   start_web();
   bool physical = store::takePortalRequest();  // held the button for Wi-Fi setup

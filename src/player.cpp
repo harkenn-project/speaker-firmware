@@ -48,7 +48,7 @@ struct Shared {
   Kind kind = Kind::Music;
   Repeat repeat = Repeat::All;
   bool shuffle = false;
-  String album, title, error;
+  String album, title, error, path;
   int track = 0, tracks = 0;
   uint32_t sleep_at = 0;  // millis() when the sleep timer goes off; 0 = none
 } shared;
@@ -306,6 +306,7 @@ bool open_track(int at) {
   xSemaphoreTake(mutex, portMAX_DELAY);
   shared.track = order[at];
   shared.title = title_of(path);
+  shared.path = path;
   xSemaphoreGive(mutex);
   LOGI(TAG, "playing %s", path.c_str());
   changed();
@@ -512,6 +513,13 @@ void setRepeat(Repeat repeat) { send(Op::Repeat, Kind::Music, static_cast<int>(r
 void sleepAfter(uint32_t minutes) { send(Op::Sleep, Kind::Music, minutes); }
 
 bool active() { return shared.state != State::Stopped; }
+
+String playingPath() {
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  const String p = shared.state != State::Stopped ? shared.path : String();
+  xSemaphoreGive(mutex);
+  return p;
+}
 
 uint32_t version() { return changes; }
 

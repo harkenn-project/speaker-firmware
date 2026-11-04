@@ -164,6 +164,12 @@ void rescan() {
   begin();
 }
 
+void refresh() {
+  if (!mounted) return;
+  read_catalogue();
+  changes++;
+}
+
 bool present() { return mounted; }
 
 bool unreadable() { return unreadable_card; }

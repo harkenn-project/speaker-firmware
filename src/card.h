@@ -15,6 +15,8 @@ namespace card {
 void begin();
 // Looks again (a card put in or taken out since); remounts and re-reads the catalogue.
 void rescan();
+// Re-reads what's on it without remounting (after a sync: music may be playing from it).
+void refresh();
 bool present();
 // A card is in the slot but its file system can't be read (exFAT, or damaged).
 bool unreadable();
