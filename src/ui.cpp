@@ -1259,11 +1259,11 @@ lv_obj_t* pill(lv_obj_t* parent, const char* icon, const char* name, const char*
   lv_obj_set_style_text_color(ic, color(theme.primary), 0);
   lv_obj_align(ic, LV_ALIGN_LEFT_MID, 0, 0);
   lv_obj_t* n = lv_label_create(b);
-  lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);
-  lv_obj_set_width(n, detail && *detail ? 92 : 122);
+  lv_obj_set_style_text_font(n, &lv_font_montserrat_14, 0);
+  lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);  // one line, cut short with "...": needs a fixed height, or it wraps
+  lv_obj_set_size(n, detail && *detail ? 104 : 124, lv_font_get_line_height(&lv_font_montserrat_14));
   lv_label_set_text(n, name);
   lv_obj_set_style_text_color(n, color(theme.text), 0);
-  lv_obj_set_style_text_font(n, &lv_font_montserrat_14, 0);
   lv_obj_align(n, LV_ALIGN_LEFT_MID, 24, 0);
   if (detail && *detail) {
     lv_obj_t* d = lv_label_create(b);
