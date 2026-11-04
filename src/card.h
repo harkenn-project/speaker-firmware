@@ -10,6 +10,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
+#include <vector>
+
 namespace card {
 
 // Mounts the card if there is one. Quick when the slot is empty.
@@ -26,6 +28,8 @@ enum class Change : uint8_t { None, Inserted, Removed, Unreadable };
 Change poll();
 void unmount();
 uint32_t freeMb();
+// The tracks of a music album, in play order, as shown ("01 Clair de lune.mp3" -> "Clair de lune").
+std::vector<String> tracks(const String& album);
 // A card is in the slot but its file system can't be read (exFAT, or damaged).
 bool unreadable();
 // Erases the card and makes it FAT32, with empty Music, Soundscapes, Meditations and Photos folders; then mounts it.

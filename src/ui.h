@@ -89,6 +89,35 @@ struct NoticeButton {
 void showNotice(const char* icon, const char* title, const char* text, NoticeKind kind, uint32_t seconds,
                 NoticeButton primary = {}, NoticeButton secondary = {});
 void hideNotice();
+// The media player on the screen. With an SD card in, a button on the home screen opens Media: Music (albums, then
+// tracks), Soundscapes and Meditations, and the player (play/pause, previous/next, stop, repeat, a sleep timer, how far
+// through around the edge). While something plays, the button is a "now playing" pill that opens the player. The
+// handlers run on the UI task with the UI locked: they should only queue things (player::...).
+struct MediaLibrary {
+  std::vector<String> albums, soundscapes, meditations;
+};
+struct MediaNow {
+  bool active = false, playing = false;
+  String kind = "music", album, title, repeat = "off";
+  int track = 0, tracks = 0;
+  uint32_t elapsed_s = 0, duration_s = 0, sleep_s = 0;
+};
+struct MediaHandlers {
+  void (*play)(const char* kind, const char* name, int track) = nullptr;
+  void (*toggle)() = nullptr;
+  void (*stop)() = nullptr;
+  void (*next)() = nullptr;
+  void (*previous)() = nullptr;
+  void (*repeat)() = nullptr;  // off -> all -> one -> off
+  void (*sleep)() = nullptr;   // off -> 15 -> 30 -> 60 minutes -> off
+  std::vector<String> (*tracks)(const char* album) = nullptr;
+};
+void setMediaLibrary(bool card, const MediaLibrary& library);  // no card: the button goes
+void setMediaNow(const MediaNow& now);
+void onMedia(const MediaHandlers& handlers);
+void hideMedia();  // closes the media screens (the speaker's about to listen or talk)
+bool mediaShown();
+
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)());
 void hideUpdateOffer();
 

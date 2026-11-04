@@ -51,7 +51,9 @@ struct Shared {
   String album, title, error, path;
   int track = 0, tracks = 0;
   uint32_t sleep_at = 0;  // millis() when the sleep timer goes off; 0 = none
+  uint32_t duration_s = 0;
 } shared;
+volatile uint64_t played_samples = 0;  // of this track, at the codec's rate (what's been handed to the audio module)
 volatile uint32_t changes = 0;
 
 // The player task's own state.
@@ -117,6 +119,7 @@ struct Source {
   File file;
   bool mp3 = false;
   int rate = 0, channels = 1;
+  uint32_t duration_s = 0;  // how long it plays, if known
   // WAV
   uint32_t data_start = 0, data_end = 0;
   // MP3
@@ -165,6 +168,7 @@ struct Source {
       } else if (!memcmp(c, "data", 4)) {
         data_start = file.position();
         data_end = data_start + size;
+        duration_s = rate && channels ? size / (2 * channels * rate) : 0;
         return rate > 0 && bits == 16;
       } else {
         file.seek(file.position() + size + (size & 1));
@@ -175,6 +179,7 @@ struct Source {
   bool open(const String& path) {
     close();
     eof = false;
+    duration_s = 0;
     pcm_len = pcm_pos = in_len = in_pos = 0;
     file = SD_MMC.open(path);
     if (!file) return false;
@@ -222,6 +227,9 @@ struct Source {
       }
       if (!samples) continue;  // skipped data (a tag, or the decoder finding its feet)
       rate = info.hz;
+      if (!duration_s && info.bitrate_kbps > 0) {  // MP3: from the file's size and its first frame's bit rate
+        duration_s = static_cast<uint32_t>(static_cast<uint64_t>(file.size()) * 8 / (info.bitrate_kbps * 1000));
+      }
       for (int i = 0; i < samples; i++) {
         pcm[i] = info.channels == 2 ? static_cast<int16_t>((frame[2 * i] + frame[2 * i + 1]) / 2) : frame[i];
       }
@@ -307,6 +315,8 @@ bool open_track(int at) {
   shared.track = order[at];
   shared.title = title_of(path);
   shared.path = path;
+  shared.duration_s = src->duration_s;
+  played_samples = 0;
   xSemaphoreGive(mutex);
   LOGI(TAG, "playing %s", path.c_str());
   changed();
@@ -366,6 +376,7 @@ void track_ended() {
   xSemaphoreGive(mutex);
   if (repeat == Repeat::One) {
     src->rewind();  // straight on: the resampler keeps its state, so a WAV loop has no seam
+    played_samples = 0;
     return;
   }
   if (position + 1 < static_cast<int>(order.size())) {
@@ -441,7 +452,11 @@ bool feed() {
   resampler.setup(src->rate ? src->rate : 44100, audio::hwRate());
   size_t made = 0;
   pending_pos += resampler.run(pending + pending_pos, pending_len - pending_pos, out, OUT_SAMPLES, &made, gain);
-  if (made) audio::writeMusic(out, made);
+  if (made) {
+    audio::writeMusic(out, made);
+    played_samples += made;
+    if (!shared.duration_s && src->duration_s) shared.duration_s = src->duration_s;  // an MP3's, once known
+  }
   return true;
 }
 
@@ -514,6 +529,29 @@ void sleepAfter(uint32_t minutes) { send(Op::Sleep, Kind::Music, minutes); }
 
 bool active() { return shared.state != State::Stopped; }
 
+Now now() {
+  Now n;
+  if (!mutex) return n;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  n.active = shared.state != State::Stopped;
+  n.playing = shared.state == State::Playing;
+  n.shuffle = shared.shuffle;
+  n.kind = shared.kind;
+  n.repeat = shared.repeat;
+  n.album = shared.album;
+  n.title = shared.title;
+  n.track = shared.track;
+  n.tracks = shared.tracks;
+  n.duration_s = shared.duration_s;
+  if (shared.sleep_at) n.sleep_s = max<int32_t>(0, static_cast<int32_t>(shared.sleep_at - millis()) / 1000);
+  xSemaphoreGive(mutex);
+  // what's been heard: handed over, less what's still waiting in the audio module's buffer
+  const uint64_t heard = played_samples > audio::musicQueued() ? played_samples - audio::musicQueued() : 0;
+  n.elapsed_s = audio::hwRate() ? heard / audio::hwRate() : 0;
+  if (n.duration_s && n.elapsed_s > n.duration_s) n.elapsed_s = n.duration_s;
+  return n;
+}
+
 String playingPath() {
   xSemaphoreTake(mutex, portMAX_DELAY);
   const String p = shared.state != State::Stopped ? shared.path : String();
@@ -536,6 +574,9 @@ void toJson(JsonObject out) {
   out["repeat"] = s.repeat == Repeat::All ? "all" : s.repeat == Repeat::One ? "one" : "off";
   out["shuffle"] = s.shuffle;
   if (s.sleep_at) out["sleep_s"] = max<int32_t>(0, static_cast<int32_t>(s.sleep_at - millis()) / 1000);
+  const Now n = now();
+  out["elapsed_s"] = n.elapsed_s;
+  if (n.duration_s) out["duration_s"] = n.duration_s;
   if (s.error.length()) out["error"] = s.error;
 }
 

@@ -77,6 +77,11 @@ supported.
      no gap at all); a meditation plays once; a sleep timer fades out over 8 s;
    - it fades out while the speaker listens, talks or rings, and pause, stop and skip fade briefly, so nothing clicks;
    - Harkenn sends `media` commands and the speaker reports `media_state` (PROTOCOL.md §10, §11).
+   - **On the screen** (ui.cpp, "The media player on the screen"): with a card in, a ♪ button on the home screen opens
+     Media (Music, Soundscapes, Meditations; albums, then tracks) and the player: play/pause, previous/next, stop,
+     repeat, a sleep timer, and how far through around the edge. While something plays the button becomes a "now
+     playing" pill. It's drawn on the speaker, not by Harkenn, so it answers at once and works without Wi-Fi; the
+     screens close after 45 s without a touch, and when the speaker starts to listen.
    - The card is kept in step with Harkenn's media library (src/cardsync.cpp, PROTOCOL.md §12): Harkenn sends a plan
      of every file it wants there; the speaker deletes only files on its own manifest (`/.harkenn/manifest.json`),
      fetches what's missing a piece at a time over the WebSocket while idle (two pieces on the way at once), checks

@@ -34,6 +34,18 @@ void sleepAfter(uint32_t minutes);  // fade out and stop then; 0 turns it off
 bool active();  // playing or paused
 // The file playing or paused ("/Music/Background/01 X.mp3"), or "": so a card sync never pulls it away.
 String playingPath();
+
+// What's playing, for the screen's player.
+struct Now {
+  bool active = false, playing = false, shuffle = false;
+  Kind kind = Kind::Music;
+  Repeat repeat = Repeat::All;
+  String album, title;
+  int track = 0, tracks = 0;
+  uint32_t elapsed_s = 0, duration_s = 0;  // duration 0: not known (yet)
+  uint32_t sleep_s = 0;                    // 0: no sleep timer
+};
+Now now();
 // Goes up on every change worth telling Harkenn about.
 uint32_t version();
 // {state: "playing"|"paused"|"stopped", kind, album, title, track, tracks, repeat, shuffle, sleep_s, error}

@@ -6,6 +6,7 @@
 #include <esp_vfs_fat.h>
 #include <sdmmc_cmd.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "board.h"
@@ -171,6 +172,28 @@ void refresh() {
 }
 
 bool present() { return mounted; }
+
+std::vector<String> tracks(const String& album) {
+  std::vector<String> names;
+  if (!mounted) return names;
+  File dir = SD_MMC.open("/Music/" + album);
+  if (!dir || !dir.isDirectory()) return names;
+  for (File f = dir.openNextFile(); f && names.size() < MAX_ENTRIES; f = dir.openNextFile()) {
+    const String n = f.name();
+    if (!f.isDirectory() && !n.startsWith(".") && is_audio(n)) names.push_back(n);
+  }
+  std::sort(names.begin(), names.end());
+  for (String& n : names) {
+    n = title(n);
+    int i = 0;
+    while (i < static_cast<int>(n.length()) && isdigit(n[i])) i++;
+    if (i > 0 && i < static_cast<int>(n.length()) && (n[i] == ' ' || n[i] == '-' || n[i] == '.')) {
+      while (i < static_cast<int>(n.length()) && (n[i] == ' ' || n[i] == '-' || n[i] == '.')) i++;
+      n = n.substring(i);
+    }
+  }
+  return names;
+}
 
 uint32_t freeMb() { return mounted ? (SD_MMC.totalBytes() - SD_MMC.usedBytes()) >> 20 : 0; }
 

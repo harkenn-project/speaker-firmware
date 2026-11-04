@@ -1055,6 +1055,65 @@ void watch_card() {
   }
 }
 
+// The screen's media player (ui.h): what's on the card, what's playing, and its buttons.
+void media_screen() {
+  static uint32_t library_seen = UINT32_MAX, player_seen = UINT32_MAX, ticked = 0;
+  if (card::version() != library_seen) {
+    library_seen = card::version();
+    ui::MediaLibrary lib;
+    if (card::present()) {
+      JsonDocument doc(cardsync::psramAllocator());
+      card::catalogue(doc.to<JsonObject>());
+      for (JsonObject a : doc["music"].as<JsonArray>()) lib.albums.push_back(a["name"] | "");
+      for (const char* n : doc["soundscapes"].as<JsonArray>()) lib.soundscapes.push_back(n);
+      for (const char* n : doc["meditations"].as<JsonArray>()) lib.meditations.push_back(n);
+    }
+    ui::setMediaLibrary(card::present(), lib);
+  }
+  if (player::version() != player_seen || (player::active() && millis() - ticked > 1000)) {
+    player_seen = player::version();
+    ticked = millis();
+    const player::Now n = player::now();
+    ui::MediaNow m;
+    m.active = n.active;
+    m.playing = n.playing;
+    m.kind = player::kindName(n.kind);
+    m.album = n.album;
+    m.title = n.title;
+    m.repeat = n.repeat == player::Repeat::All ? "all" : n.repeat == player::Repeat::One ? "one" : "off";
+    m.track = n.track;
+    m.tracks = n.tracks;
+    m.elapsed_s = n.elapsed_s;
+    m.duration_s = n.duration_s;
+    m.sleep_s = n.sleep_s;
+    ui::setMediaNow(m);
+  }
+  if (voice != Voice::Off && ui::mediaShown()) ui::hideMedia();  // let the character listen and talk
+}
+
+void media_handlers() {
+  ui::MediaHandlers h;
+  h.play = [](const char* kind, const char* name, int track) {
+    player::Kind k;
+    if (player::parseKind(kind, &k)) player::play(k, name, track);
+  };
+  h.toggle = [] { player::now().playing ? player::pause() : player::resume(); };
+  h.stop = [] { player::stop(); };
+  h.next = [] { player::next(); };
+  h.previous = [] { player::previous(); };
+  h.repeat = [] {
+    const player::Repeat r = player::now().repeat;
+    player::setRepeat(r == player::Repeat::Off ? player::Repeat::All
+                      : r == player::Repeat::All ? player::Repeat::One : player::Repeat::Off);
+  };
+  h.sleep = [] {
+    const uint32_t s = player::now().sleep_s;
+    player::sleepAfter(!s ? 15 : s <= 15 * 60 ? 30 : s <= 30 * 60 ? 60 : 0);
+  };
+  h.tracks = [](const char* album) { return card::tracks(album); };
+  ui::onMedia(h);
+}
+
 // What the player is doing (player.h), whenever it changes.
 void send_media() {
   media_sent = player::version();
@@ -2232,6 +2291,7 @@ bool run_online(bool use_relay = false) {
     // the SD card catches up with Harkenn's plan while the speaker's idle
     cardsync::loop(voice == Voice::Off && !ring_id.length() && !timer_ringing(), ws_connected);
     watch_card();
+    media_screen();
     // Music fades out while the speaker listens, talks or rings, and comes back after.
     audio::holdMusic(audio::HOLD_VOICE, voice != Voice::Off || ring_id.length() || timer_ringing());
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
@@ -2428,6 +2488,7 @@ void main_task(void*) {
   card::begin();
   player::begin();
   cardsync::begin([](JsonDocument& doc) { send_json(doc); });
+  media_handlers();
   board::setBrightness(brightness);
   start_web();
   bool physical = store::takePortalRequest();  // held the button for Wi-Fi setup

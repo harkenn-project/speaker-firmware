@@ -205,6 +205,9 @@ const lv_font_t* font(const String& size) {
   return &lv_font_montserrat_18;
 }
 
+void forget_media_button();
+void add_media_button(lv_obj_t* scr);
+
 // Removes everything from the screen and paints the theme background.
 lv_obj_t* reset_screen() {
   lv_obj_t* scr = lv_screen_active();
@@ -215,6 +218,7 @@ lv_obj_t* reset_screen() {
   touch_layer = volume_arc = volume_label = nullptr;
   progress_bar = progress_detail = offer_panel = nullptr;
   screen_layer = screen_press = nullptr;
+  forget_media_button();
   screen_regions.clear();
   progress_title = "";
   if (flash_timer) {
@@ -610,6 +614,7 @@ void showLayout(const Theme& t, const std::vector<Widget>& widgets, bool clock24
     lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
   }
   create_touch_layer(scr);  // on top of the layout
+  add_media_button(scr);    // the media player's button (with an SD card in)
   create_offer(scr);        // and the update prompt above that
   update_clock();
   apply_state();
@@ -1168,4 +1173,379 @@ void onScreenTap(void (*on_tap)(const char* label)) {
   screen_tap_cb = on_tap;
 }
 
+}  // namespace ui
+
+// The media player on the screen: with an SD card in, a button on the home screen opens Media (Music, Soundscapes,
+// Meditations), lists, and the player, so the card plays without talking to anyone. Drawn here on the speaker (not by
+// Harkenn) so it answers taps at once and works without Wi-Fi, like the card it plays.
+
+namespace ui {
+namespace {
+
+enum class View : uint8_t { None, Home, List, Tracks, Player };
+constexpr uint32_t MEDIA_IDLE_MS = 45000;  // the media screens close after this long without a touch
+
+bool media_card = false;
+MediaLibrary media_lib;
+MediaNow media_now;
+MediaHandlers media_do;
+lv_obj_t* media_button = nullptr;  // on the home screen
+lv_obj_t* media_panel = nullptr;   // the open view, over everything
+lv_timer_t* media_timer = nullptr;
+View media_view = View::None;
+String list_kind;                  // "music", "soundscape", "meditation"
+String list_album;                 // for Tracks
+std::vector<String> list_names;    // what the open list shows
+
+// the player's parts, updated by setMediaNow
+lv_obj_t* p_arc = nullptr;
+lv_obj_t* p_kind = nullptr;
+lv_obj_t* p_title = nullptr;
+lv_obj_t* p_sub = nullptr;
+lv_obj_t* p_play = nullptr;
+lv_obj_t* p_repeat = nullptr;
+lv_obj_t* p_sleep = nullptr;
+
+void open_view(View v);
+
+String clock_text(uint32_t s) {
+  char t[16];
+  if (s >= 3600) snprintf(t, sizeof(t), "%u:%02u:%02u", s / 3600, (s / 60) % 60, s % 60);
+  else snprintf(t, sizeof(t), "%u:%02u", s / 60, s % 60);
+  return t;
+}
+
+const char* kind_word(const String& kind) {
+  return kind == "soundscape" ? "Soundscapes" : kind == "meditation" ? "Meditations" : "Music";
+}
+
+void close_media() {
+  if (media_timer) lv_timer_delete(media_timer);
+  media_timer = nullptr;
+  if (media_panel) lv_obj_delete_async(media_panel);
+  media_panel = p_arc = p_kind = p_title = p_sub = p_play = p_repeat = p_sleep = nullptr;
+  media_view = View::None;
+}
+
+// A round icon button; `cb` gets `data` as its user data.
+lv_obj_t* icon_button(lv_obj_t* parent, const char* text, int x, int y, int size, bool filled, lv_event_cb_t cb,
+                      void* data = nullptr) {
+  lv_obj_t* b = lv_button_create(parent);
+  lv_obj_set_size(b, size, size);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_set_style_bg_color(b, color(filled ? theme.primary : theme.surface), 0);
+  lv_obj_set_style_bg_color(b, color(filled ? theme.text : theme.muted), LV_STATE_PRESSED);
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_color(l, color(filled ? theme.background : theme.text), 0);
+  lv_obj_set_style_text_font(l, size >= 56 ? &lv_font_montserrat_24 : &lv_font_montserrat_18, 0);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, data);
+  return b;
+}
+
+// A wide pill in a list: an icon, the name (cut short with "..."), and a muted detail on the right.
+lv_obj_t* pill(lv_obj_t* parent, const char* icon, const char* name, const char* detail, lv_event_cb_t cb, intptr_t i) {
+  lv_obj_t* b = lv_button_create(parent);
+  lv_obj_set_size(b, lv_pct(100), 42);
+  lv_obj_set_style_radius(b, 21, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_set_style_bg_color(b, color(theme.surface), 0);
+  lv_obj_set_style_bg_color(b, color(theme.primary), LV_STATE_PRESSED);
+  lv_obj_set_style_pad_hor(b, 14, 0);
+  lv_obj_t* ic = lv_label_create(b);
+  lv_label_set_text(ic, icon);
+  lv_obj_set_style_text_color(ic, color(theme.primary), 0);
+  lv_obj_align(ic, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_t* n = lv_label_create(b);
+  lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(n, detail && *detail ? 92 : 122);
+  lv_label_set_text(n, name);
+  lv_obj_set_style_text_color(n, color(theme.text), 0);
+  lv_obj_set_style_text_font(n, &lv_font_montserrat_14, 0);
+  lv_obj_align(n, LV_ALIGN_LEFT_MID, 24, 0);
+  if (detail && *detail) {
+    lv_obj_t* d = lv_label_create(b);
+    lv_label_set_text(d, detail);
+    lv_obj_set_style_text_color(d, color(theme.muted), 0);
+    lv_obj_set_style_text_font(d, &lv_font_montserrat_14, 0);
+    lv_obj_align(d, LV_ALIGN_RIGHT_MID, 0, 0);
+  }
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, reinterpret_cast<void*>(i));
+  return b;
+}
+
+lv_obj_t* scroll_list(lv_obj_t* parent, int y, int h) {
+  lv_obj_t* box = lv_obj_create(parent);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_size(box, 176, h);
+  lv_obj_set_pos(box, 32, y);
+  lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(box, 8, 0);
+  lv_obj_set_scroll_dir(box, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_OFF);
+  return box;
+}
+
+void back_button(lv_obj_t* parent, lv_event_cb_t cb) { icon_button(parent, LV_SYMBOL_LEFT, 98, 196, 44, false, cb); }
+
+int32_t uptr(lv_event_t* e) { return static_cast<int32_t>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e))); }
+
+// Home: up to three big choices, only those with something on the card.
+void build_home() {
+  if (media_now.active) {  // what's playing takes the title's place: a tap goes back to it
+    lv_obj_t* b = pill(media_panel, media_now.playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE, media_now.title.c_str(), "",
+                       [](lv_event_t*) { open_view(View::Player); }, 0);
+    lv_obj_set_size(b, 150, 36);
+    lv_obj_set_pos(b, 45, 20);
+    lv_obj_set_style_bg_color(b, color(theme.primary), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(b, 0), color(theme.background), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(b, 1), color(theme.background), 0);
+  } else {
+    label(media_panel, "Media", &lv_font_montserrat_24, theme.text, 0, 22, 240, 30);
+  }
+  struct Choice { const char* kind; const char* icon; size_t count; };
+  const Choice choices[] = {{"music", LV_SYMBOL_AUDIO, media_lib.albums.size()},
+                            {"soundscape", LV_SYMBOL_LOOP, media_lib.soundscapes.size()},
+                            {"meditation", LV_SYMBOL_BELL, media_lib.meditations.size()}};
+  int y = 64;
+  bool any = false;
+  for (int i = 0; i < 3; i++) {
+    if (!choices[i].count) continue;
+    any = true;
+    char n[8];
+    snprintf(n, sizeof(n), "%u", static_cast<unsigned>(choices[i].count));
+    lv_obj_t* b = pill(media_panel, choices[i].icon, kind_word(choices[i].kind), n, [](lv_event_t* e) {
+      static const char* kinds[] = {"music", "soundscape", "meditation"};
+      list_kind = kinds[uptr(e)];
+      open_view(View::List);
+    }, i);
+    lv_obj_set_size(b, 176, 42);
+    lv_obj_set_pos(b, 32, y);
+    y += 50;
+  }
+  if (!any) {
+    label(media_panel, "Nothing on the card yet. Send some from Harkenn's media pages.", &lv_font_montserrat_14,
+          theme.muted, 30, 80, 180, 80, 4);
+  }
+  icon_button(media_panel, LV_SYMBOL_CLOSE, 98, 196, 44, false, [](lv_event_t*) { close_media(); });
+}
+
+// A list: albums, soundscapes or meditations; or an album's tracks.
+void build_list(bool tracks) {
+  const char* title = tracks ? list_album.c_str() : kind_word(list_kind);
+  label(media_panel, title, &lv_font_montserrat_18, theme.text, 30, 24, 180, 26);
+  list_names = tracks ? (media_do.tracks ? media_do.tracks(list_album.c_str()) : std::vector<String>{})
+                      : list_kind == "music" ? media_lib.albums
+                      : list_kind == "soundscape" ? media_lib.soundscapes
+                                                  : media_lib.meditations;
+  lv_obj_t* box = scroll_list(media_panel, 56, 132);
+  if (tracks && list_names.size() > 1) {
+    pill(box, LV_SYMBOL_PLAY, "Play all", "", [](lv_event_t*) {
+      if (media_do.play) media_do.play("music", list_album.c_str(), 0);
+      open_view(View::Player);
+    }, 0);
+  }
+  const char* icon = tracks ? LV_SYMBOL_AUDIO : list_kind == "music" ? LV_SYMBOL_LIST
+                     : list_kind == "soundscape" ? LV_SYMBOL_LOOP : LV_SYMBOL_BELL;
+  for (size_t i = 0; i < list_names.size(); i++) {
+    char n[8] = "";
+    if (tracks) snprintf(n, sizeof(n), "%u", static_cast<unsigned>(i + 1));
+    pill(box, icon, list_names[i].c_str(), n, [](lv_event_t* e) {
+      const size_t i = uptr(e);
+      if (i >= list_names.size()) return;
+      if (media_view == View::Tracks) {
+        if (media_do.play) media_do.play("music", list_album.c_str(), i);
+        open_view(View::Player);
+      } else if (list_kind == "music") {
+        list_album = list_names[i];
+        open_view(View::Tracks);
+      } else {
+        if (media_do.play) media_do.play(list_kind.c_str(), list_names[i].c_str(), 0);
+        open_view(View::Player);
+      }
+    }, static_cast<intptr_t>(i));
+  }
+  back_button(media_panel, [](lv_event_t*) { open_view(media_view == View::Tracks ? View::List : View::Home); });
+}
+
+void update_player() {
+  if (media_view != View::Player || !p_title) return;
+  const MediaNow& n = media_now;
+  String kind = n.kind == "soundscape" ? "SOUNDSCAPE" : n.kind == "meditation" ? "MEDITATION" : "MUSIC";
+  if (n.kind == "music" && n.tracks > 1) kind += "  " + String(n.track + 1) + " / " + String(n.tracks);
+  lv_label_set_text(p_kind, kind.c_str());
+  lv_label_set_text(p_title, n.active ? n.title.c_str() : "Stopped");
+  String sub = n.kind == "music" ? n.album + "  " : String();
+  sub += clock_text(n.elapsed_s);
+  if (n.duration_s && n.kind != "soundscape") sub += " / " + clock_text(n.duration_s);
+  lv_label_set_text(p_sub, sub.c_str());
+  lv_label_set_text(lv_obj_get_child(p_play, 0), n.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+  if (n.duration_s) {
+    lv_obj_remove_flag(p_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_arc_set_value(p_arc, static_cast<int32_t>(1000ull * n.elapsed_s / n.duration_s));
+  } else {
+    lv_obj_add_flag(p_arc, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (p_repeat) {
+    lv_label_set_text(lv_obj_get_child(p_repeat, 0), n.repeat == "one" ? LV_SYMBOL_LOOP "1" : LV_SYMBOL_LOOP);
+    lv_obj_set_style_bg_color(p_repeat, color(n.repeat == "off" ? theme.surface : theme.primary), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(p_repeat, 0), color(n.repeat == "off" ? theme.muted : theme.background), 0);
+  }
+  char z[12];
+  if (n.sleep_s) snprintf(z, sizeof(z), "%um", static_cast<unsigned>((n.sleep_s + 59) / 60));
+  else snprintf(z, sizeof(z), "Zz");
+  lv_label_set_text(lv_obj_get_child(p_sleep, 0), z);
+  lv_obj_set_style_bg_color(p_sleep, color(n.sleep_s ? theme.primary : theme.surface), 0);
+  lv_obj_set_style_text_color(lv_obj_get_child(p_sleep, 0), color(n.sleep_s ? theme.background : theme.muted), 0);
+}
+
+void build_player() {
+  p_arc = lv_arc_create(media_panel);  // how far through, around the edge
+  lv_obj_set_size(p_arc, 236, 236);
+  lv_obj_set_pos(p_arc, 2, 2);
+  lv_arc_set_rotation(p_arc, 270);
+  lv_arc_set_bg_angles(p_arc, 0, 360);
+  lv_arc_set_range(p_arc, 0, 1000);
+  lv_obj_remove_flag(p_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(p_arc, 4, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(p_arc, 4, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(p_arc, color(theme.surface), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(p_arc, color(theme.primary), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(p_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(p_arc, 0, LV_PART_KNOB);
+
+  p_kind = label(media_panel, "", &lv_font_montserrat_14, theme.primary, 30, 30, 180, 18);
+  p_title = label(media_panel, "", &lv_font_montserrat_18, theme.text, 26, 50, 188, 44, 2);
+  p_sub = label(media_panel, "", &lv_font_montserrat_14, theme.muted, 30, 96, 180, 18);
+  const bool album = media_now.kind == "music" && media_now.tracks > 1;
+  if (album) {
+    icon_button(media_panel, LV_SYMBOL_PREV, 40, 128, 44, false, [](lv_event_t*) { if (media_do.previous) media_do.previous(); });
+    icon_button(media_panel, LV_SYMBOL_NEXT, 156, 128, 44, false, [](lv_event_t*) { if (media_do.next) media_do.next(); });
+  }
+  p_play = icon_button(media_panel, LV_SYMBOL_PAUSE, 90, 120, 60, true, [](lv_event_t*) { if (media_do.toggle) media_do.toggle(); });
+  // the second row: home, stop, repeat (music), sleep timer
+  const int y = 188;
+  icon_button(media_panel, LV_SYMBOL_HOME, album ? 46 : 58, y, 36, false, [](lv_event_t*) { close_media(); });
+  icon_button(media_panel, LV_SYMBOL_STOP, album ? 86 : 102, y, 36, false, [](lv_event_t*) {
+    if (media_do.stop) media_do.stop();
+    open_view(View::Home);
+  });
+  p_repeat = album ? icon_button(media_panel, LV_SYMBOL_LOOP, 126, y, 36, false, [](lv_event_t*) { if (media_do.repeat) media_do.repeat(); })
+                   : nullptr;
+  p_sleep = icon_button(media_panel, "Zz", album ? 166 : 146, y, 36, false, [](lv_event_t*) { if (media_do.sleep) media_do.sleep(); });
+  lv_obj_set_style_text_font(lv_obj_get_child(p_sleep, 0), &lv_font_montserrat_14, 0);
+  update_player();
+}
+
+void open_view(View v) {
+  if (v == View::None || !media_card) {
+    close_media();
+    return;
+  }
+  if (media_timer) lv_timer_delete(media_timer);
+  media_timer = nullptr;
+  if (media_panel) lv_obj_delete_async(media_panel);
+  media_panel = p_arc = p_kind = p_title = p_sub = p_play = p_repeat = p_sleep = nullptr;
+  media_view = v;
+  media_panel = full_panel();
+  if (v == View::Home) build_home();
+  else if (v == View::List) build_list(false);
+  else if (v == View::Tracks) build_list(true);
+  else build_player();
+  animate(media_panel, anim_opa, LV_OPA_TRANSP, LV_OPA_COVER, 160);
+  board::markActivity();
+  // closes itself after a while without a touch (music plays on; the home screen's button comes back to it)
+  media_timer = lv_timer_create([](lv_timer_t*) {
+    if (lv_display_get_inactive_time(nullptr) > MEDIA_IDLE_MS) close_media();
+  }, 1000, nullptr);
+}
+
+void update_media_button() {
+  if (!media_button) return;
+  if (!media_card) {
+    lv_obj_add_flag(media_button, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_remove_flag(media_button, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t* l = lv_obj_get_child(media_button, 0);
+  if (media_now.active) {  // a "now playing" pill that opens the player
+    lv_obj_set_size(media_button, 132, 34);
+    lv_obj_set_pos(media_button, 54, 178);
+    lv_obj_set_style_radius(media_button, 17, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(l, 112);
+    const String t = String(media_now.playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE) + "  " + media_now.title;
+    lv_label_set_text(l, t.c_str());
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  } else {
+    lv_obj_set_size(media_button, 40, 40);
+    lv_obj_set_pos(media_button, 100, 176);
+    lv_obj_set_style_radius(media_button, LV_RADIUS_CIRCLE, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(l, LV_SIZE_CONTENT);
+    lv_label_set_text(l, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_18, 0);
+  }
+  lv_obj_center(l);
+}
+
+void create_media_button(lv_obj_t* scr) {
+  media_button = lv_button_create(scr);
+  lv_obj_set_style_shadow_width(media_button, 0, 0);
+  lv_obj_set_style_bg_color(media_button, color(theme.surface), 0);
+  lv_obj_set_style_bg_opa(media_button, LV_OPA_80, 0);
+  lv_obj_set_style_bg_color(media_button, color(theme.primary), LV_STATE_PRESSED);
+  lv_obj_t* l = lv_label_create(media_button);
+  lv_obj_set_style_text_color(l, color(theme.text), 0);
+  lv_obj_add_event_cb(media_button, [](lv_event_t*) { open_view(media_now.active ? View::Player : View::Home); },
+                      LV_EVENT_CLICKED, nullptr);
+  update_media_button();
+}
+
+}  // namespace
+
+void setMediaLibrary(bool card, const MediaLibrary& lib) {
+  Lock l;
+  media_card = card;
+  media_lib = lib;
+  update_media_button();
+  if (!card) close_media();
+  else if (media_view == View::Home || media_view == View::List) open_view(media_view);  // show what changed
+}
+
+void setMediaNow(const MediaNow& now) {
+  Lock l;
+  const bool was_active = media_now.active;
+  const bool reshape = media_now.kind != now.kind || media_now.tracks != now.tracks || media_now.title != now.title;
+  media_now = now;
+  update_media_button();
+  if (media_view == View::Player) {
+    if (!now.active && was_active) open_view(View::Home);
+    else if (reshape) open_view(View::Player);  // a different kind of thing: its own buttons
+    else update_player();
+  }
+}
+
+void onMedia(const MediaHandlers& h) {
+  Lock l;
+  media_do = h;
+}
+
+void hideMedia() {
+  Lock l;
+  if (media_view != View::None) close_media();
+}
+
+bool mediaShown() { return media_view != View::None; }
+
+}  // namespace ui
+
+namespace ui {
+namespace {
+void forget_media_button() { media_button = nullptr; }  // deleted with the screen
+void add_media_button(lv_obj_t* scr) { create_media_button(scr); }
+}  // namespace
 }  // namespace ui
