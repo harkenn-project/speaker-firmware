@@ -1189,7 +1189,6 @@ bool media_card = false;
 MediaLibrary media_lib;
 MediaNow media_now;
 MediaHandlers media_do;
-lv_obj_t* media_button = nullptr;  // on the home screen
 lv_obj_t* media_panel = nullptr;   // the open view, over everything
 lv_timer_t* media_timer = nullptr;
 View media_view = View::None;
@@ -1463,47 +1462,34 @@ void open_view(View v) {
   }, 1000, nullptr);
 }
 
+// The media player's way in: a note in the status row at the top (the same on every layout, so it never covers the
+// clock). Muted with a card in, the theme's colour and pulsing gently while something plays, still while paused.
+lv_obj_t* status_media = nullptr;
+bool status_media_pulsing = false;
+
 void update_media_button() {
-  if (!media_button) return;
-  if (!media_card) {
-    lv_obj_add_flag(media_button, LV_OBJ_FLAG_HIDDEN);
-    return;
+  make_status_row();
+  if (!status_media) {
+    status_media = lv_label_create(status_row);
+    lv_label_set_text(status_media, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(status_media, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(status_media, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(status_media, 18);  // easy to hit, though the note is small
+    lv_obj_add_event_cb(status_media, [](lv_event_t*) { open_view(media_now.active ? View::Player : View::Home); },
+                        LV_EVENT_CLICKED, nullptr);
   }
-  lv_obj_remove_flag(media_button, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_t* l = lv_obj_get_child(media_button, 0);
-  if (media_now.active) {  // a "now playing" pill that opens the player
-    lv_obj_set_size(media_button, 132, 34);
-    lv_obj_set_pos(media_button, 54, 178);
-    lv_obj_set_style_radius(media_button, 17, 0);
-    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(l, 112);
-    const String t = String(media_now.playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE) + "  " + media_now.title;
-    lv_label_set_text(l, t.c_str());
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-  } else {
-    lv_obj_set_size(media_button, 40, 40);
-    lv_obj_set_pos(media_button, 100, 176);
-    lv_obj_set_style_radius(media_button, LV_RADIUS_CIRCLE, 0);
-    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(l, LV_SIZE_CONTENT);
-    lv_label_set_text(l, LV_SYMBOL_AUDIO);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_18, 0);
+  show_if(status_media, media_card);
+  lv_obj_set_style_text_color(status_media, color(media_now.active ? theme.primary : theme.muted), 0);
+  const bool pulse = media_card && media_now.playing;
+  if (pulse != status_media_pulsing) {
+    status_media_pulsing = pulse;
+    lv_anim_delete(status_media, anim_opa);
+    lv_obj_set_style_opa(status_media, LV_OPA_COVER, 0);
+    if (pulse) animate(status_media, anim_opa, LV_OPA_COVER, LV_OPA_40, 900, -1, true);
   }
-  lv_obj_center(l);
 }
 
-void create_media_button(lv_obj_t* scr) {
-  media_button = lv_button_create(scr);
-  lv_obj_set_style_shadow_width(media_button, 0, 0);
-  lv_obj_set_style_bg_color(media_button, color(theme.surface), 0);
-  lv_obj_set_style_bg_opa(media_button, LV_OPA_80, 0);
-  lv_obj_set_style_bg_color(media_button, color(theme.primary), LV_STATE_PRESSED);
-  lv_obj_t* l = lv_label_create(media_button);
-  lv_obj_set_style_text_color(l, color(theme.text), 0);
-  lv_obj_add_event_cb(media_button, [](lv_event_t*) { open_view(media_now.active ? View::Player : View::Home); },
-                      LV_EVENT_CLICKED, nullptr);
-  update_media_button();
-}
+void create_media_button(lv_obj_t*) { update_media_button(); }
 
 }  // namespace
 
@@ -1545,7 +1531,7 @@ bool mediaShown() { return media_view != View::None; }
 
 namespace ui {
 namespace {
-void forget_media_button() { media_button = nullptr; }  // deleted with the screen
+void forget_media_button() {}
 void add_media_button(lv_obj_t* scr) { create_media_button(scr); }
 }  // namespace
 }  // namespace ui
