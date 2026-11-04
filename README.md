@@ -32,7 +32,7 @@ supported.
    - It applies config pushes live.
    - It sends status every 30 s and log lines every 2 s.
    - It handles the commands `reboot`, `identify`, `refresh_config`, `set_volume`, `play_state`,
-     `update_firmware` (see *Updates* below) and `factory_reset`.
+     `update_firmware` (see *Updates* below), `factory_reset`, `card_rescan` and `card_format`.
    - The screen sleeps after `sleep_after_s` without a touch: dimmed with the character's sleeping animation,
      dimmed with only a big clock, or off (`sleep_display`).
 5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
@@ -63,7 +63,17 @@ supported.
    taps to answer.
 12. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
    wins over the config unless the volume in the config changes.
-13. **BOOT button.**
+13. **The SD card and the player.** A micro SD card is optional (src/card.cpp). At boot the speaker mounts it
+   (1-bit SD mode on GPIO 17/18/21; the slot has no card-detect line) and tells Harkenn what's on it: music albums,
+   soundscapes, meditations and photo albums ([MEDIA.md](https://github.com/harkenn-project/server-docker/blob/main/docs/MEDIA.md)).
+   It must be FAT32; a card it can't read (exFAT, most cards over 32 GB) is reported as such, and `card_format` makes
+   it FAT32. The player (src/player.cpp) decodes MP3 (minimp3) or WAV into its own stream at the codec's rate,
+   resampled and filtered below 11 kHz so it stays clear of the wake word arbitration tones (src/resample.h):
+   - music plays an album in order or shuffled (repeat off, all or one); a soundscape loops until stopped (a WAV with
+     no gap at all); a meditation plays once; a sleep timer fades out over 8 s;
+   - it fades out while the speaker listens, talks or rings, and pause, stop and skip fade briefly, so nothing clicks;
+   - Harkenn sends `media` commands and the speaker reports `media_state` (PROTOCOL.md §10, §11).
+14. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.
     - Hold 3 s: power off (a press turns it back on).
     - Hold 6 s: restarts with the hotspot and its page up (for 10 minutes before it tries its saved networks).
@@ -160,7 +170,12 @@ To restore the stock XiaoZhi firmware, write the full backup back to address 0 w
 - Internal RAM is tight. TLS allocates in PSRAM (main.cpp), as do the wake word's tensor arena and stack and other
   large buffers; screens arrive over the WebSocket rather than a second HTTPS download. The status sent to Harkenn
   includes free internal RAM, its largest block and each task's unused stack.
-- `lib/tflm` and `lib/esp-nn` are vendored by `tools/vendor_tflm.py`.
+- `lib/tflm` and `lib/esp-nn` are vendored by `tools/vendor_tflm.py`. `lib/minimp3` is only `minimp3.h` from
+  [lieff/minimp3](https://github.com/lieff/minimp3) (CC0), at commit ea99364.
+- The player's decoder and buffers are in PSRAM (its task's stack too: minimp3 keeps ~16 KB of scratch on it).
+- `test/resample_test.cpp` checks the resampler and the MP3 decoding on a PC (MSVC or any C++17 compiler; the
+  command is at the top of the file): the same output however the input is chopped up, a clean 1 kHz tone, nothing
+  near the arbitration tones, and a seamless loop.
 - If the picture comes out rotated or mirrored, change `DISPLAY_ROTATION` in `src/board.cpp`. Values 4-7 are the
   mirrored variants.
 - Battery percentage assumes a 1:2 divider on GPIO1. Charging is read from GPIO41, assumed active-low. Both still
