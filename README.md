@@ -65,8 +65,10 @@ supported.
    wins over the config unless the volume in the config changes.
 13. **The SD card and the player.** A micro SD card is optional (src/card.cpp). The speaker mounts it (1-bit SD
    mode on GPIO 17/18/21). The slot has no card-detect line, so while idle it polls: an empty slot every 5 s or more
-   (spaced by how long a try takes), a mounted card every 3 s with a raw sector read; a card put in or taken out
-   shows a notification with a chime. It tells Harkenn what's on it: music albums,
+   (spaced by how long a try takes), a mounted card every 3 s with a raw sector read. A card put in or taken out
+   shows a system notice with a chime ("SD card ready, 14.9 GB free", "SD card removed"); one it can't read offers
+   **Format** or **Dismiss** and stays until one is tapped (also at startup). System notices (`ui::showNotice`) pop up
+   in the middle with an icon, a title, a line or two and up to two buttons, unlike mail (`ui::showNotification`). It tells Harkenn what's on it: music albums,
    soundscapes, meditations and photo albums ([MEDIA.md](https://github.com/harkenn-project/server-docker/blob/main/docs/MEDIA.md)).
    It must be FAT32; a card it can't read (exFAT, most cards over 32 GB) is reported as such, and `card_format` makes
    it FAT32. The player (src/player.cpp) decodes MP3 (minimp3) or WAV into its own stream at the codec's rate,

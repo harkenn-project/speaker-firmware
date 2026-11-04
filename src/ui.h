@@ -76,6 +76,19 @@ void showNotification(const char* title, const char* text, uint32_t seconds, voi
 
 // "Update available vX" with Install / Dismiss on top of the home screen, until hidden. The buttons call the
 // callbacks (on the UI task, UI locked) and hide the prompt.
+// System notices (the speaker telling you something about itself, e.g. the SD card): a card that pops up in the
+// middle, with an icon in a tinted badge, a title and a line or two. Not mail (that's showNotification). With no
+// buttons it goes after `seconds`; with one or two it stays until one is tapped. Text is plain ASCII: the fonts have
+// no other characters. A new notice replaces the one showing.
+constexpr const char* ICON_SD_CARD = "ï";  // LV_SYMBOL_SD_CARD
+enum class NoticeKind : uint8_t { Info, Good, Warning };
+struct NoticeButton {
+  const char* label = nullptr;
+  void (*on_tap)() = nullptr;
+};
+void showNotice(const char* icon, const char* title, const char* text, NoticeKind kind, uint32_t seconds,
+                NoticeButton primary = {}, NoticeButton secondary = {});
+void hideNotice();
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)());
 void hideUpdateOffer();
 

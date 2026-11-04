@@ -991,13 +991,35 @@ void send_status() {
 
 bool timer_ringing();
 
+// "SD card ready" (or "SD card formatted"), with how much room there is: plain ASCII, the fonts have nothing else.
+void card_ready_notice(const char* title) {
+  char text[40];
+  snprintf(text, sizeof(text), "%.1f GB free", card::freeMb() / 1024.0);
+  board::markActivity();
+  audio::play(audio::Sound::Notify);
+  ui::showNotice(ui::ICON_SD_CARD, title, text, ui::NoticeKind::Good, 5);
+}
+
+// A card that can't be read (exFAT, or damaged): offer to format it. Stays until Format or Dismiss.
+void unreadable_notice() {
+  board::markActivity();
+  audio::play(audio::Sound::Notify);
+  ui::showNotice(ui::ICON_SD_CARD, "Can't read this card", "Format it to use it here. That erases it.",
+                 ui::NoticeKind::Warning, 0, {"Format", [] { card_format_wanted = true; }}, {"Dismiss", nullptr});
+}
+
 // The slot has no card-detect line: look every few seconds while the speaker's idle. A mounted card is a quick
 // raw read; an empty slot is a mount attempt, so how often follows how long one takes (at most every 5 s).
 void watch_card() {
   static uint32_t next = 0, every = 5000;
   static int timed = 0;
+  static bool first = true;
   if (static_cast<int32_t>(millis() - next) < 0) return;
   if (voice != Voice::Off || ring_id.length() || timer_ringing() || cardsync::busy()) return;
+  if (first) {  // started with an unreadable card in: offer to format it now
+    first = false;
+    if (card::unreadable()) unreadable_notice();
+  }
   const uint32_t t0 = millis();
   const card::Change change = card::poll();
   const uint32_t took = millis() - t0;
@@ -1008,28 +1030,24 @@ void watch_card() {
     every = 3000;
   }
   next = millis() + every;
-  auto tell = [](const char* text) {
-    board::markActivity();
-    audio::play(audio::Sound::Notify);
-    ui::showNotification("SD card", text, 6, [] {});
-  };
   switch (change) {
-    case card::Change::Inserted: {
-      char text[48];
-      snprintf(text, sizeof(text), "Ready \xc2\xb7 %.1f GB free", card::freeMb() / 1024.0);
-      tell(text);
+    case card::Change::Inserted:
+      card_ready_notice("SD card ready");
       send_status();
       break;
-    }
     case card::Change::Unreadable:
-      tell("It can't be read. Format it from Harkenn.");
+      board::markActivity();
+      audio::play(audio::Sound::Notify);
+      unreadable_notice();
       break;
     case card::Change::Removed:
       player::stop();
       cardsync::reset();
       delay(150);  // let the player close its file
       card::unmount();
-      tell("Taken out");
+      board::markActivity();
+      audio::play(audio::Sound::Notify);
+      ui::showNotice(ui::ICON_SD_CARD, "SD card removed", "", ui::NoticeKind::Info, 5);  // also closes "Format?"
       send_status();
       break;
     case card::Change::None:
@@ -2192,7 +2210,13 @@ bool run_online(bool use_relay = false) {
       cardsync::reset();  // drop any sync under way
       player::stop();
       delay(150);  // let it close its file
-      card::format();
+      ui::showNotice(ui::ICON_SD_CARD, "Formatting...", "Erasing the SD card", ui::NoticeKind::Info, 60);
+      if (card::format()) {
+        card_ready_notice("SD card formatted");
+      } else {
+        ui::showNotice(ui::ICON_SD_CARD, "Couldn't format it", "Try formatting it on a computer, as FAT32.",
+                       ui::NoticeKind::Warning, 8);
+      }
       send_status();
     }
     if (card_rescan_wanted) {

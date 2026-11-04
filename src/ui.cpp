@@ -945,6 +945,117 @@ void showNotification(const char* title, const char* text, uint32_t seconds, voi
   }, 100, nullptr);
 }
 
+namespace {
+lv_obj_t* notice_panel = nullptr;
+lv_timer_t* notice_timer = nullptr;
+void (*notice_taps[2])() = {nullptr, nullptr};
+uint32_t notice_hide_at = 0;
+
+void close_notice() {
+  if (notice_timer) lv_timer_delete(notice_timer);
+  notice_timer = nullptr;
+  if (notice_panel) lv_obj_delete_async(notice_panel);
+  notice_panel = nullptr;
+}
+
+void anim_translate_y(void* o, int32_t v) { lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(o), v, 0); }
+
+lv_obj_t* notice_button(const char* text, int index, bool primary, uint32_t tint, int x, int w, int y) {
+  lv_obj_t* b = lv_button_create(notice_panel);
+  lv_obj_set_size(b, w, 36);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_style_bg_color(b, color(primary ? tint : theme.background), 0);
+  lv_obj_set_style_radius(b, 18, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_color(l, color(primary ? theme.background : theme.muted), 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(
+      b,
+      [](lv_event_t* e) {
+        void (*fn)() = notice_taps[reinterpret_cast<intptr_t>(lv_event_get_user_data(e))];
+        close_notice();  // deleted later: we're inside its button's handler
+        if (fn) fn();
+      },
+      LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<intptr_t>(index)));
+  return b;
+}
+}  // namespace
+
+void showNotice(const char* icon, const char* title, const char* text, NoticeKind kind, uint32_t seconds,
+                NoticeButton primary, NoticeButton secondary) {
+  Lock l;
+  close_notice();
+  const uint32_t tint = kind == NoticeKind::Good ? 0x6be3a4 : kind == NoticeKind::Warning ? 0xffb547 : theme.primary;
+  const bool buttons = primary.label != nullptr;
+  notice_taps[0] = primary.on_tap;
+  notice_taps[1] = secondary.on_tap;
+  const int w = 204, h = buttons ? 172 : 126;
+  notice_panel = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(notice_panel, w, h);
+  lv_obj_align(notice_panel, LV_ALIGN_CENTER, 0, buttons ? 4 : 0);
+  lv_obj_set_style_bg_color(notice_panel, color(theme.surface), 0);
+  lv_obj_set_style_bg_opa(notice_panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(notice_panel, 0, 0);
+  lv_obj_set_style_radius(notice_panel, 26, 0);
+  lv_obj_set_style_shadow_width(notice_panel, 24, 0);
+  lv_obj_set_style_shadow_color(notice_panel, lv_color_black(), 0);
+  lv_obj_set_style_shadow_opa(notice_panel, LV_OPA_50, 0);
+  lv_obj_set_style_pad_all(notice_panel, 0, 0);
+  lv_obj_remove_flag(notice_panel, LV_OBJ_FLAG_SCROLLABLE);
+  if (status_row) lv_obj_move_foreground(status_row);
+
+  lv_obj_t* badge = lv_obj_create(notice_panel);  // the icon in a soft, tinted circle
+  lv_obj_set_size(badge, 40, 40);
+  lv_obj_align(badge, LV_ALIGN_TOP_MID, 0, 12);
+  lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(badge, color(tint), 0);
+  lv_obj_set_style_bg_opa(badge, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(badge, 0, 0);
+  lv_obj_set_style_pad_all(badge, 0, 0);
+  lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* glyph = lv_label_create(badge);
+  lv_label_set_text(glyph, icon && *icon ? icon : LV_SYMBOL_BELL);
+  lv_obj_set_style_text_color(glyph, color(tint), 0);
+  lv_obj_set_style_text_font(glyph, &lv_font_montserrat_18, 0);
+  lv_obj_center(glyph);
+
+  label(notice_panel, title, &lv_font_montserrat_18, theme.text, 10, 58, w - 20, 24);
+  label(notice_panel, text, &lv_font_montserrat_14, theme.muted, 14, 82, w - 28, 36, 2);
+  if (buttons) {
+    if (secondary.label) {
+      notice_button(primary.label, 0, true, tint, 12, 86, 124);
+      notice_button(secondary.label, 1, false, tint, w - 98, 86, 124);
+    } else {
+      notice_button(primary.label, 0, true, tint, (w - 120) / 2, 120, 124);
+    }
+  }
+  // pops up: fades in as it rises a little into place
+  animate(notice_panel, anim_opa, LV_OPA_TRANSP, LV_OPA_COVER, 220);
+  animate(notice_panel, anim_translate_y, 18, 0, 320, 0, false, lv_anim_path_ease_out);
+  animate(badge, anim_opa, LV_OPA_TRANSP, LV_OPA_COVER, 300, 0, false, lv_anim_path_ease_out, 120);
+  if (!buttons) {
+    notice_hide_at = millis() + max<uint32_t>(2, seconds) * 1000;
+    notice_timer = lv_timer_create([](lv_timer_t*) {
+      if (static_cast<int32_t>(millis() - notice_hide_at) < 0 || !notice_panel) return;
+      animate(notice_panel, anim_opa, LV_OPA_COVER, LV_OPA_TRANSP, 260);  // and fades away
+      notice_hide_at = millis() + 100000;
+      lv_timer_t* gone = lv_timer_create([](lv_timer_t* t) {
+        lv_timer_delete(t);
+        close_notice();
+      }, 300, nullptr);
+      lv_timer_set_repeat_count(gone, 1);
+    }, 100, nullptr);
+  }
+}
+
+void hideNotice() {
+  Lock l;
+  close_notice();
+}
+
 void showUpdateOffer(const char* version, void (*on_install)(), void (*on_dismiss)()) {
   Lock l;
   if (offer_panel) lv_obj_delete(offer_panel);
