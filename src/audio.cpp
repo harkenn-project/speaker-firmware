@@ -220,7 +220,10 @@ const Note* notes_for(Sound s) {
   return TICK;
 }
 
+uint32_t quiet_since = 0;  // when the play task last had nothing to play (0: it just played something)
+
 void write_raw(const int16_t* data, size_t count) {  // 48 kHz
+  quiet_since = 0;
   size_t written;
   i2s_channel_write(tx, data, count * sizeof(int16_t), &written, pdMS_TO_TICKS(500));
 }
@@ -334,11 +337,46 @@ bool play_clip(Sound s) {
   return true;
 }
 
+// Music from the SD card: PCM at the codec's rate in a PSRAM stream buffer, written by the player task. Fades in and
+// out over FADE_MS so pausing, holding for a conversation and resuming never click.
+constexpr size_t MUSIC_BUFFER_BYTES = 96 * 1024;  // 1 s at 48 kHz: commands take effect quickly
+constexpr uint32_t MUSIC_FADE_MS = 40;
+StreamBufferHandle_t music = nullptr;
+volatile uint8_t music_holds = 0;
+volatile bool music_out = false;  // coming out of the speaker now
+float music_level = 0;  // 0..1, the fade; only the play task touches it
+
+// One chunk of music, if any is due (not held, or still fading out). True if it played something.
+bool play_music() {
+  static int16_t mbuf[CHUNK * RATIO];
+  const float target = music_holds ? 0.0f : 1.0f;
+  if (!music || (target == 0 && music_level <= 0)) {
+    music_out = false;
+    return false;
+  }
+  const size_t n = xStreamBufferReceive(music, mbuf, CHUNK * ratio * sizeof(int16_t), 0) / sizeof(int16_t);
+  if (!n) {
+    if (target == 0) music_level = 0;
+    music_out = false;
+    return false;
+  }
+  const float step = 1000.0f / (MUSIC_FADE_MS * SAMPLE_RATE * ratio);
+  for (size_t i = 0; i < n; i++) {
+    music_level = target > music_level ? min(target, music_level + step) : max(target, music_level - step);
+    mbuf[i] = static_cast<int16_t>(mbuf[i] * music_level);
+  }
+  amp(true);
+  write_raw(mbuf, n);
+  music_out = true;
+  return true;
+}
+
 void play_task(void*) {
   static int16_t buf[CHUNK];
   for (;;) {
     Sound s;
-    if (xQueueReceive(queue, &s, speech_on ? 0 : pdMS_TO_TICKS(AMP_OFF_AFTER_MS)) == pdTRUE) {
+    const bool music_due = music && xStreamBufferBytesAvailable(music) && (!music_holds || music_level > 0);
+    if (xQueueReceive(queue, &s, speech_on || music_due ? 0 : pdMS_TO_TICKS(music ? 10 : AMP_OFF_AFTER_MS)) == pdTRUE) {
       if (s == Sound::Claim) {  // inaudible: played whatever the volume
         sound_playing = true;
         amp(true);
@@ -367,6 +405,9 @@ void play_task(void*) {
       }
       continue;
     }
+    if (play_music()) continue;
+    if (!quiet_since) quiet_since = millis() | 1;
+    if (millis() - quiet_since < AMP_OFF_AFTER_MS) continue;  // let the DMA buffers drain (or music catch up)
     amp(false);
   }
 }
@@ -563,7 +604,8 @@ bool begin(bool ultrasonic) {
   queue = xQueueCreate(8, sizeof(Sound));
   speech = psram_stream(SPEECH_BUFFER_BYTES);
   mic = psram_stream(MIC_BUFFER_BYTES);
-  if (!speech || !mic) {
+  music = psram_stream(MUSIC_BUFFER_BYTES);
+  if (!speech || !mic || !music) {
     LOGE(TAG, "out of memory for audio buffers");
     return false;
   }
@@ -728,6 +770,30 @@ void stopSpeech() {
 bool speaking() { return speech_on; }
 
 bool ultrasonic() { return ratio == RATIO; }
+
+int hwRate() { return SAMPLE_RATE * ratio; }
+
+size_t musicSpace() { return ok ? xStreamBufferSpacesAvailable(music) / sizeof(int16_t) : 0; }
+
+size_t musicQueued() { return ok ? xStreamBufferBytesAvailable(music) / sizeof(int16_t) : 0; }
+
+size_t writeMusic(const int16_t* pcm, size_t samples) {
+  return ok ? xStreamBufferSend(music, pcm, samples * sizeof(int16_t), 0) / sizeof(int16_t) : 0;
+}
+
+void holdMusic(uint8_t reason, bool on) {
+  if (on) music_holds |= reason;
+  else music_holds &= ~reason;
+}
+
+bool musicHeld() { return music_holds; }
+
+void clearMusic() {
+  if (!ok) return;
+  for (int i = 0; i < 10 && xStreamBufferReset(music) != pdPASS; i++) delay(5);
+}
+
+bool musicPlaying() { return music_out; }
 
 void claim(int level) {
   if (!ok || ratio != RATIO) return;

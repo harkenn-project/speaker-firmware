@@ -65,6 +65,20 @@ void endSpeech();
 void stopSpeech();
 bool speaking();
 
+// Music from the SD card (player.cpp): mono 16-bit PCM at hwRate(), the codec's rate, so it isn't squeezed into
+// speech's 16 kHz. Sounds and speech play over it (it waits meanwhile). It fades out while any hold is on and fades
+// back in when they're all off; what's buffered stays, so a pause resumes where it left off.
+constexpr uint8_t HOLD_PAUSED = 1;  // the player is paused
+constexpr uint8_t HOLD_VOICE = 2;   // listening, talking or ringing (app.cpp)
+int hwRate();
+size_t musicSpace();  // samples writeMusic() would take now
+size_t musicQueued();  // samples waiting to be played
+size_t writeMusic(const int16_t* pcm, size_t samples);  // returns samples accepted
+void holdMusic(uint8_t reason, bool on);
+bool musicHeld();
+void clearMusic();  // drops what's buffered (a new track, or stop)
+bool musicPlaying();  // music is coming out of the speaker now
+
 // Wake word arbitration (app.cpp): speakers that heard the wake word tell each other how loudly, above hearing.
 // A claim is three short tones: CLAIM_HZ[0]; CLAIM_HZ[1] exactly CLAIM_AB_MS later (the signature: a stray tone
 // can't pass for it); then CLAIM_HZ[2], CLAIM_BC_MS + level x CLAIM_SLOT_MS after that, which says how loud the

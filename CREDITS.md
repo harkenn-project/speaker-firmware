@@ -17,6 +17,7 @@ The Harkenn speaker firmware is built on these projects. Thank you to all of the
 | TensorFlow's micro audio frontend ([tensorflow/lite/experimental/microfrontend](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/experimental/microfrontend)) | Wake word audio features | Apache-2.0 |
 | [kissfft](https://github.com/mborgerding/kissfft) (Mark Borgerding), bundled with esp-tflite-micro | FFT for those features | BSD-3-Clause |
 | [esp-nn](https://github.com/espressif/esp-nn) (Espressif, in `lib/esp-nn`) | ESP32-S3 vector kernels for the model | Apache-2.0 |
+| [minimp3](https://github.com/lieff/minimp3) (lieff; `minimp3.h` at commit ea99364, in `lib/minimp3`) | Decodes MP3s from the SD card | CC0-1.0 |
 | [FlatBuffers](https://github.com/google/flatbuffers), [gemmlowp](https://github.com/google/gemmlowp), [ruy](https://github.com/google/ruy) (Google), bundled with esp-tflite-micro | Model format and maths helpers for TFLM | Apache-2.0 |
 | [microWakeWord](https://github.com/kahrendt/microWakeWord) (Kevin Ahrendt) | The wake word models' design and feature settings the speaker follows, and the "stop" model it listens for while a timer or alarm rings; the models themselves come from Harkenn | Apache-2.0 |
 | [ISRG Root X1 and X2](https://letsencrypt.org/certificates/) (Let's Encrypt), [GTS Root R1, R3, R4](https://pki.goog/repository/) (Google Trust Services), [SSL.com Root CAs](https://www.ssl.com/repository/) (RSA, ECC) | Root certificates in `src/ca_certs.h`, for servers on https and the relay behind Cloudflare | public |

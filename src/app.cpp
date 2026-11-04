@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "board.h"
 #include "card.h"
+#include "player.h"
 #include "ca_certs.h"
 #include "logbuf.h"
 #include "relay.h"
@@ -267,6 +268,7 @@ volatile bool update_check_wanted = false;
 volatile bool factory_reset_wanted = false;  // Harkenn asked
 volatile bool card_rescan_wanted = false;  // Harkenn asked
 uint32_t card_sent = UINT32_MAX;  // the card::version() Harkenn last heard about
+uint32_t media_sent = UINT32_MAX;  // the player::version() Harkenn last heard about
 char device_name[49] = "";
 char offered_version[32] = "";  // the firmware Harkenn offered, for the page
 bool static_ip_set = false;      // this connection uses a static IP from the saved network
@@ -983,6 +985,46 @@ void send_status() {
   s["hotspot"] = web::hotspotOn();
   card::addStatus(s);
   send_json(doc);
+}
+
+// What the player is doing (player.h), whenever it changes.
+void send_media() {
+  media_sent = player::version();
+  if (!ws_connected) return;
+  JsonDocument doc;
+  doc["type"] = "media_state";
+  player::toJson(doc["media"].to<JsonObject>());
+  send_json(doc);
+}
+
+// Harkenn's media commands (docs/PROTOCOL.md, "The media player").
+void handle_media(JsonDocument& doc) {
+  const String action = doc["action"] | "";
+  if (action == "play") {
+    player::Kind kind;
+    if (!player::parseKind(doc["kind"] | "music", &kind)) return;
+    player::play(kind, doc["album"] | "", doc["track"] | 0, doc["shuffle"] | false);
+    if (doc["repeat"].is<const char*>()) {
+      player::Repeat r;
+      if (player::parseRepeat(doc["repeat"] | "", &r)) player::setRepeat(r);
+    }
+    if (doc["minutes"].is<int>()) player::sleepAfter(doc["minutes"] | 0);
+  } else if (action == "pause") {
+    player::pause();
+  } else if (action == "resume") {
+    player::resume();
+  } else if (action == "stop") {
+    player::stop();
+  } else if (action == "next") {
+    player::next();
+  } else if (action == "previous") {
+    player::previous();
+  } else if (action == "repeat") {
+    player::Repeat r;
+    if (player::parseRepeat(doc["mode"] | "", &r)) player::setRepeat(r);
+  } else if (action == "sleep") {
+    player::sleepAfter(doc["minutes"] | 0);
+  }
 }
 
 // What's on the SD card (or that there isn't one), whenever it changes and on connecting.
@@ -1719,6 +1761,8 @@ void handle_text(const uint8_t* payload, size_t len) {
     send_text("{\"type\":\"pong\"}");
   } else if (type == "timer") {
     handle_timer(doc);
+  } else if (type == "media") {
+    handle_media(doc);
   } else if (type == "notify") {
     handle_notify(doc);
   } else if (type == "notifications_clear") {
@@ -1824,6 +1868,7 @@ void on_connected() {
   local_changes_due = true;
   timers_sent = UINT32_MAX;  // tell Harkenn what's set
   card_sent = UINT32_MAX;
+  media_sent = UINT32_MAX;
   LOGI(TAG, via_relay ? "connected to Harkenn through the relay" : "connected to Harkenn");
   // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
   esp_ota_mark_app_valid_cancel_rollback();
@@ -2081,10 +2126,15 @@ bool run_online(bool use_relay = false) {
     }
     if (card_rescan_wanted) {
       card_rescan_wanted = false;
+      player::stop();
+      delay(150);  // let it close its file
       card::rescan();
       send_status();
     }
     if (ws_connected && card_sent != card::version()) send_card();
+    if (ws_connected && media_sent != player::version()) send_media();
+    // Music fades out while the speaker listens, talks or rings, and comes back after.
+    audio::holdMusic(audio::HOLD_VOICE, voice != Voice::Off || ring_id.length() || timer_ringing());
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
@@ -2277,6 +2327,7 @@ void main_task(void*) {
 
   ui::showMessage("Starting", ap_name().c_str());
   card::begin();
+  player::begin();
   board::setBrightness(brightness);
   start_web();
   bool physical = store::takePortalRequest();  // held the button for Wi-Fi setup
