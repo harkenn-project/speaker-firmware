@@ -172,6 +172,40 @@ void refresh() {
 
 bool present() { return mounted; }
 
+uint32_t freeMb() { return mounted ? (SD_MMC.totalBytes() - SD_MMC.usedBytes()) >> 20 : 0; }
+
+Change poll() {
+  if (mounted) {
+    static uint8_t sector[512];
+    return SD_MMC.readRAW(sector, 0) ? Change::None : Change::Removed;  // a real read: FATFS caches the rest
+  }
+  const bool was_unreadable = unreadable_card;
+  unreadable_card = false;
+  mounted = mount();
+  if (mounted) {
+    LOGI(TAG, "SD card put in: %llu MB, %llu MB free", SD_MMC.totalBytes() >> 20,
+         (SD_MMC.totalBytes() - SD_MMC.usedBytes()) >> 20);
+    read_catalogue();
+    changes++;
+    return Change::Inserted;
+  }
+  if (unreadable_card != was_unreadable) {
+    changes++;
+    if (unreadable_card) LOGW(TAG, "an SD card was put in, but it can't be read (exFAT, or damaged)");
+    return unreadable_card ? Change::Unreadable : Change::Removed;
+  }
+  return Change::None;
+}
+
+void unmount() {
+  if (mounted) SD_MMC.end();
+  mounted = false;
+  unreadable_card = false;
+  forget();
+  changes++;
+  LOGI(TAG, "SD card taken out");
+}
+
 bool unreadable() { return unreadable_card; }
 
 bool format() {

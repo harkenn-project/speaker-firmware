@@ -2,7 +2,8 @@
 // The speaker works the same without a card; then present() is false and the media features stay hidden.
 //
 // Layout (docs/MEDIA.md in server-docker): /Music/<album>/, /Soundscapes/, /Meditations/, /Photos/<album>/; a folder's
-// cover.jpg is its artwork. The slot has no card-detect line, so the card is looked for at boot and on rescan().
+// cover.jpg is its artwork. The slot has no card-detect line, so the app polls (poll()): an empty slot is tried every
+// few seconds, a mounted card is checked with a raw read of its first sector.
 // The card must be FAT32 (FAT16 works too): cards over 32 GB come as exFAT, which the speaker can't read; it says so
 // (unreadable()) and format() makes it FAT32.
 #pragma once
@@ -18,6 +19,13 @@ void rescan();
 // Re-reads what's on it without remounting (after a sync: music may be playing from it).
 void refresh();
 bool present();
+// What poll() found.
+enum class Change : uint8_t { None, Inserted, Removed, Unreadable };
+// One look at the slot: mounts a card that's appeared; says a mounted one has gone (then stop using it and call
+// unmount()). Quick with a card in; with the slot empty it's a mount attempt, so the app spaces these out.
+Change poll();
+void unmount();
+uint32_t freeMb();
 // A card is in the slot but its file system can't be read (exFAT, or damaged).
 bool unreadable();
 // Erases the card and makes it FAT32, with empty Music, Soundscapes, Meditations and Photos folders; then mounts it.

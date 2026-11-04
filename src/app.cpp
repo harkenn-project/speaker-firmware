@@ -989,6 +989,54 @@ void send_status() {
   send_json(doc);
 }
 
+bool timer_ringing();
+
+// The slot has no card-detect line: look every few seconds while the speaker's idle. A mounted card is a quick
+// raw read; an empty slot is a mount attempt, so how often follows how long one takes (at most every 5 s).
+void watch_card() {
+  static uint32_t next = 0, every = 5000;
+  static int timed = 0;
+  if (static_cast<int32_t>(millis() - next) < 0) return;
+  if (voice != Voice::Off || ring_id.length() || timer_ringing() || cardsync::busy()) return;
+  const uint32_t t0 = millis();
+  const card::Change change = card::poll();
+  const uint32_t took = millis() - t0;
+  if (!card::present()) {
+    every = constrain(took * 20, 5000u, 30000u);
+    if (timed < 3) LOGI(TAG, "looking for an SD card took %u ms; next look in %u s", took, every / 1000), timed++;
+  } else {
+    every = 3000;
+  }
+  next = millis() + every;
+  auto tell = [](const char* text) {
+    board::markActivity();
+    audio::play(audio::Sound::Notify);
+    ui::showNotification("SD card", text, 6, [] {});
+  };
+  switch (change) {
+    case card::Change::Inserted: {
+      char text[48];
+      snprintf(text, sizeof(text), "Ready \xc2\xb7 %.1f GB free", card::freeMb() / 1024.0);
+      tell(text);
+      send_status();
+      break;
+    }
+    case card::Change::Unreadable:
+      tell("It can't be read. Format it from Harkenn.");
+      break;
+    case card::Change::Removed:
+      player::stop();
+      cardsync::reset();
+      delay(150);  // let the player close its file
+      card::unmount();
+      tell("Taken out");
+      send_status();
+      break;
+    case card::Change::None:
+      break;
+  }
+}
+
 // What the player is doing (player.h), whenever it changes.
 void send_media() {
   media_sent = player::version();
@@ -2159,6 +2207,7 @@ bool run_online(bool use_relay = false) {
     if (ws_connected && media_sent != player::version()) send_media();
     // the SD card catches up with Harkenn's plan while the speaker's idle
     cardsync::loop(voice == Voice::Off && !ring_id.length() && !timer_ringing(), ws_connected);
+    watch_card();
     // Music fades out while the speaker listens, talks or rings, and comes back after.
     audio::holdMusic(audio::HOLD_VOICE, voice != Voice::Off || ring_id.length() || timer_ringing());
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();

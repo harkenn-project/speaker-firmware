@@ -63,8 +63,10 @@ supported.
    taps to answer.
 12. **Touch.** Tap the middle to talk or stop. Drag around the edge to change the volume; the speaker's own volume
    wins over the config unless the volume in the config changes.
-13. **The SD card and the player.** A micro SD card is optional (src/card.cpp). At boot the speaker mounts it
-   (1-bit SD mode on GPIO 17/18/21; the slot has no card-detect line) and tells Harkenn what's on it: music albums,
+13. **The SD card and the player.** A micro SD card is optional (src/card.cpp). The speaker mounts it (1-bit SD
+   mode on GPIO 17/18/21). The slot has no card-detect line, so while idle it polls: an empty slot every 5 s or more
+   (spaced by how long a try takes), a mounted card every 3 s with a raw sector read; a card put in or taken out
+   shows a notification with a chime. It tells Harkenn what's on it: music albums,
    soundscapes, meditations and photo albums ([MEDIA.md](https://github.com/harkenn-project/server-docker/blob/main/docs/MEDIA.md)).
    It must be FAT32; a card it can't read (exFAT, most cards over 32 GB) is reported as such, and `card_format` makes
    it FAT32. The player (src/player.cpp) decodes MP3 (minimp3) or WAV into its own stream at the codec's rate,
@@ -75,7 +77,8 @@ supported.
    - Harkenn sends `media` commands and the speaker reports `media_state` (PROTOCOL.md §10, §11).
    - The card is kept in step with Harkenn's media library (src/cardsync.cpp, PROTOCOL.md §12): Harkenn sends a plan
      of every file it wants there; the speaker deletes only files on its own manifest (`/.harkenn/manifest.json`),
-     fetches what's missing a piece at a time over the WebSocket while idle, checks each SHA-256, and resumes after a
+     fetches what's missing a piece at a time over the WebSocket while idle (two pieces on the way at once), checks
+     each SHA-256, and resumes after a
      restart. Files copied onto the card some other way are never touched. The plan and the manifest live in PSRAM.
 14. **BOOT button.**
     - Short press: mutes or unmutes the mic (remembered across restarts). The character shows its muted animation.

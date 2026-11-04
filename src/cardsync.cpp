@@ -17,6 +17,7 @@ namespace {
 constexpr const char* TAG = "cardsync";
 constexpr const char* MANIFEST = "/.harkenn/manifest.json";
 constexpr size_t GET_BYTES = 32 * 1024;       // asked for at a time
+constexpr int IN_FLIGHT = 2;                  // pieces asked for ahead: the next is on its way while one's written
 constexpr uint32_t CHUNK_TIMEOUT_MS = 30000;  // no answer: ask again
 constexpr uint32_t REPORT_MS = 1000;
 
@@ -42,7 +43,9 @@ uint64_t total_bytes = 0, done_bytes = 0;
 
 // the file being fetched
 File part;
-uint32_t offset = 0;
+uint32_t offset = 0;     // written so far
+uint32_t asked_to = 0;   // asked for up to here
+int in_flight = 0;       // pieces asked for and not yet all here
 mbedtls_sha256_context sha;
 bool sha_on = false;
 uint32_t expect = 0, got = 0;  // the piece on its way
@@ -151,6 +154,8 @@ void open_next() {
     return;
   }
   done_bytes += offset;
+  asked_to = offset;
+  in_flight = 0;
   step = Step::Fetch;
 }
 
@@ -255,7 +260,7 @@ void onPlan(const char* json, size_t len) {
 }
 
 void onChunk(JsonDocument& doc) {
-  if (step != Step::Wait || todo_at >= todo.size()) return;
+  if ((step != Step::Wait && step != Step::Fetch) || todo_at >= todo.size() || expect) return;
   JsonObject w = current();
   if (strcmp(w["path"] | "", doc["path"] | "") || (doc["offset"] | -1) != static_cast<long>(offset)) return;
   expect = doc["bytes"] | 0;
@@ -264,7 +269,7 @@ void onChunk(JsonDocument& doc) {
 }
 
 bool onBinary(const uint8_t* data, size_t len) {
-  if (step != Step::Wait || !expect || got >= expect) return false;
+  if ((step != Step::Wait && step != Step::Fetch) || !expect || got >= expect) return false;
   const size_t n = min<size_t>(len, expect - got);
   if (part.write(data, n) != n) {
     fail("couldn't write to the card (is it full?)");
@@ -276,6 +281,8 @@ bool onBinary(const uint8_t* data, size_t len) {
     offset += got;
     done_bytes += got;
     expect = got = 0;
+    in_flight = max(0, in_flight - 1);
+    asked_at = millis();
     if (offset >= (current()["size"] | 0)) finish_file();
     else step = Step::Fetch;
   }
@@ -291,30 +298,35 @@ void loop(bool idle, bool connected) {
       open_next();
       return;
     case Step::Wait:
-      if (static_cast<int32_t>(millis() - asked_at) > static_cast<int32_t>(CHUNK_TIMEOUT_MS)) {
-        // no answer, or the connection dropped mid-piece: start the file again from what's really in its .part
+    case Step::Fetch: {
+      if (in_flight && static_cast<int32_t>(millis() - asked_at) > static_cast<int32_t>(CHUNK_TIMEOUT_MS)) {
+        // nothing for a while (the connection dropped?): start the file again from what's really in its .part
         part.close();
         done_bytes -= offset;
         expect = got = 0;
+        in_flight = 0;
         step = Step::Start;
+        return;
       }
-      return;
-    case Step::Fetch: {
       if (!connected) return;
       JsonObject w = current();
-      if (!idle) {
+      const uint32_t size = w["size"] | 0;
+      if (!idle) {  // what's asked for still arrives; nothing more until it's idle again
         if (!paused_reported) report("paused", w["path"] | ""), paused_reported = true;
         return;
       }
       paused_reported = false;
-      const uint32_t size = w["size"] | 0;
-      JsonDocument doc;
-      doc["type"] = "card_get";
-      doc["path"] = w["path"];
-      doc["offset"] = offset;
-      doc["length"] = min<uint32_t>(GET_BYTES, size - offset);
-      if (sender) sender(doc);
-      asked_at = millis();
+      while (in_flight < IN_FLIGHT && asked_to < size) {
+        JsonDocument doc;
+        doc["type"] = "card_get";
+        doc["path"] = w["path"];
+        doc["offset"] = asked_to;
+        doc["length"] = min<uint32_t>(GET_BYTES, size - asked_to);
+        if (sender) sender(doc);
+        asked_to += doc["length"].as<uint32_t>();
+        if (!in_flight) asked_at = millis();
+        in_flight++;
+      }
       step = Step::Wait;
       if (millis() - last_report > REPORT_MS) report("syncing", w["path"] | "");
       return;
