@@ -8,6 +8,7 @@ constexpr int TOUCH_SDA = 11, TOUCH_SCL = 7, TOUCH_RST = 6, TOUCH_INT = 12;
 constexpr int CODEC_SDA = 15, CODEC_SCL = 14, AMP_EN = 46;
 constexpr int I2S_MCLK = 16, I2S_WS = 45, I2S_BCLK = 9, I2S_DIN = 10, I2S_DOUT = 8;
 constexpr int BOOT_BUTTON = 0, BATTERY_ADC = 1, CHARGE_STATUS = 41, LED = 48;
+constexpr int SD_CLK = 17, SD_CMD = 18, SD_D0 = 21;  // micro SD, 1-bit mode (D3 = GPIO13, pulled up); no card detect
 }  // namespace pins
 
 namespace board {

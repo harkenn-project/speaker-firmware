@@ -24,6 +24,7 @@
 
 #include "audio.h"
 #include "board.h"
+#include "card.h"
 #include "ca_certs.h"
 #include "logbuf.h"
 #include "relay.h"
@@ -264,6 +265,8 @@ volatile bool reconnect_wanted = false;    // the server address changed
 volatile bool local_changes_due = true;    // send local changes to Harkenn (at every connection too)
 volatile bool update_check_wanted = false;
 volatile bool factory_reset_wanted = false;  // Harkenn asked
+volatile bool card_rescan_wanted = false;  // Harkenn asked
+uint32_t card_sent = UINT32_MAX;  // the card::version() Harkenn last heard about
 char device_name[49] = "";
 char offered_version[32] = "";  // the firmware Harkenn offered, for the page
 bool static_ip_set = false;      // this connection uses a static IP from the saved network
@@ -978,6 +981,17 @@ void send_status() {
   s["via_relay"] = via_relay;
   s["local_locked"] = web::locked();
   s["hotspot"] = web::hotspotOn();
+  card::addStatus(s);
+  send_json(doc);
+}
+
+// What's on the SD card (or that there isn't one), whenever it changes and on connecting.
+void send_card() {
+  card_sent = card::version();
+  if (!ws_connected) return;
+  JsonDocument doc;
+  doc["type"] = "card";
+  card::catalogue(doc["card"].to<JsonObject>());
   send_json(doc);
 }
 
@@ -1774,6 +1788,8 @@ void handle_text(const uint8_t* payload, size_t len) {
       restart();
     } else if (command == "factory_reset") {
       factory_reset_wanted = true;  // from the main loop
+    } else if (command == "card_rescan") {
+      card_rescan_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
     } else if (command == "refresh_config") {
@@ -1807,6 +1823,7 @@ void on_connected() {
   first_ws_config = true;
   local_changes_due = true;
   timers_sent = UINT32_MAX;  // tell Harkenn what's set
+  card_sent = UINT32_MAX;
   LOGI(TAG, via_relay ? "connected to Harkenn through the relay" : "connected to Harkenn");
   // This firmware reached the server: keep it (cancels rollback when the bootloader supports it).
   esp_ota_mark_app_valid_cancel_rollback();
@@ -2062,6 +2079,12 @@ bool run_online(bool use_relay = false) {
       delay(1000);
       ESP.restart();
     }
+    if (card_rescan_wanted) {
+      card_rescan_wanted = false;
+      card::rescan();
+      send_status();
+    }
+    if (ws_connected && card_sent != card::version()) send_card();
     if (ws_connected && millis() - last_status > STATUS_INTERVAL_MS) send_status();
     if (millis() - last_log_flush > LOG_FLUSH_MS) flush_logs();
     update_voice();
@@ -2253,6 +2276,7 @@ void main_task(void*) {
               });
 
   ui::showMessage("Starting", ap_name().c_str());
+  card::begin();
   board::setBrightness(brightness);
   start_web();
   bool physical = store::takePortalRequest();  // held the button for Wi-Fi setup
