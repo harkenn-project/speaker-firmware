@@ -81,7 +81,8 @@ supported.
      (where it can't cover any layout's clock) opens Media (Music, Soundscapes, Meditations; albums, then tracks) and
      the player: play/pause, previous/next, stop, repeat, a sleep timer, and how far through around the edge. While
      something plays the ♪ pulses and opens the player. It's drawn on the speaker, not by Harkenn, so it answers at once and works without Wi-Fi; the
-     screens close after 45 s without a touch, and when the speaker starts to listen.
+     screens close after 45 s without a touch, and when the speaker starts to listen. Dragging a finger around the
+     edge changes the volume there too, as on the home screen.
    - The card is kept in step with Harkenn's media library (src/cardsync.cpp, PROTOCOL.md §12): Harkenn sends a plan
      of every file it wants there; the speaker deletes only files on its own manifest (`/.harkenn/manifest.json`),
      fetches what's missing a piece at a time over the WebSocket while idle (two pieces on the way at once), checks

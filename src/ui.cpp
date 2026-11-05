@@ -215,6 +215,8 @@ lv_obj_t* reset_screen() {
   player_stop(screen_player);
   lv_obj_clean(scr);
   ring = anim_img = clock_label = date_label = status_label = flash = nullptr;
+  if (volume_arc) lv_obj_delete(volume_arc);  // they're on the top layer, which isn't cleaned with the screen
+  if (volume_label) lv_obj_delete(volume_label);
   touch_layer = volume_arc = volume_label = nullptr;
   progress_bar = progress_detail = offer_panel = nullptr;
   screen_layer = screen_press = nullptr;
@@ -377,6 +379,8 @@ void apply_state() {
 // Volume arc
 
 void show_volume(int percent) {
+  if (volume_arc) lv_obj_move_foreground(volume_arc);
+  if (volume_label) lv_obj_move_foreground(volume_label);
   if (!volume_arc) return;
   lv_arc_set_value(volume_arc, percent);
   lv_label_set_text_fmt(volume_label, percent ? "%d%%" : "Silent", percent);
@@ -440,8 +444,49 @@ void create_offer(lv_obj_t* scr) {
   offer_button(offer_panel, "Dismiss", theme.background, theme.muted, 100, offer_dismiss);
 }
 
+// Touches: dragging around the edge changes the volume; on the home screen (user data non-null) a tap in the
+// middle talks too. The media screens use it for the edge only.
+void touch_event(lv_event_t* e) {
+  const bool talk = lv_event_get_user_data(e) != nullptr;
+  const lv_event_code_t code = lv_event_get_code(e);
+  lv_indev_t* indev = lv_indev_active();
+  if (!indev) return;
+  lv_point_t p;
+  lv_indev_get_point(indev, &p);
+  const float dx = p.x - board::SCREEN_SIZE / 2, dy = p.y - board::SCREEN_SIZE / 2;
+  const float r = sqrtf(dx * dx + dy * dy);
+  const float angle = atan2f(dy, dx) * 180.0f / PI;  // clockwise on screen
+  Gesture& g = gesture;
+  if (code == LV_EVENT_PRESSED) {
+    g = Gesture{};
+    g.edge = r >= EDGE_RADIUS;
+    g.start = p;
+    g.last_angle = angle;
+    g.t0 = millis();
+  } else if (code == LV_EVENT_PRESSING) {
+    if (g.edge) {
+      if (r < 40) return;  // the angle is meaningless near the centre
+      float d = angle - g.last_angle;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      g.last_angle = angle;
+      g.accum += d;
+      if (!g.dragging && fabsf(g.accum) > 8) g.dragging = true;
+      const int steps = static_cast<int>(g.accum / DEGREES_PER_PERCENT);
+      if (g.dragging && steps && volume_cb) {
+        g.accum -= steps * DEGREES_PER_PERCENT;
+        show_volume(volume_cb(steps));
+      }
+    } else if (abs(p.x - g.start.x) + abs(p.y - g.start.y) > 24) {
+      g.cancelled = true;  // a swipe, not a tap
+    }
+  } else if (code == LV_EVENT_RELEASED) {
+    if (talk && !g.edge && !g.cancelled && millis() - g.t0 < 1000 && tap_cb) tap_cb();
+  }
+}
+
 void create_touch_layer(lv_obj_t* scr) {
-  volume_arc = lv_arc_create(scr);
+  volume_arc = lv_arc_create(lv_layer_top());  // over everything: the media screens are on the top layer too
   lv_obj_set_size(volume_arc, board::SCREEN_SIZE - 8, board::SCREEN_SIZE - 8);
   lv_obj_set_pos(volume_arc, 4, 4);
   lv_arc_set_rotation(volume_arc, 135);  // gap at the bottom; 0% bottom-left, 100% bottom-right
@@ -456,7 +501,7 @@ void create_touch_layer(lv_obj_t* scr) {
   lv_obj_set_style_pad_all(volume_arc, 0, LV_PART_KNOB);
   lv_obj_add_flag(volume_arc, LV_OBJ_FLAG_HIDDEN);
 
-  volume_label = label(scr, "", &lv_font_montserrat_24, theme.text, 60, 196, 120, 30);
+  volume_label = label(lv_layer_top(), "", &lv_font_montserrat_24, theme.text, 60, 196, 120, 30);
   lv_obj_add_flag(volume_label, LV_OBJ_FLAG_HIDDEN);
   volume_timer = lv_timer_create(hide_volume, VOLUME_HIDE_MS, nullptr);
   lv_timer_pause(volume_timer);
@@ -466,46 +511,7 @@ void create_touch_layer(lv_obj_t* scr) {
   lv_obj_set_size(touch_layer, board::SCREEN_SIZE, board::SCREEN_SIZE);
   lv_obj_set_pos(touch_layer, 0, 0);
   lv_obj_remove_flag(touch_layer, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_event_cb(
-      touch_layer,
-      [](lv_event_t* e) {
-        const lv_event_code_t code = lv_event_get_code(e);
-        lv_indev_t* indev = lv_indev_active();
-        if (!indev) return;
-        lv_point_t p;
-        lv_indev_get_point(indev, &p);
-        const float dx = p.x - board::SCREEN_SIZE / 2, dy = p.y - board::SCREEN_SIZE / 2;
-        const float r = sqrtf(dx * dx + dy * dy);
-        const float angle = atan2f(dy, dx) * 180.0f / PI;  // clockwise on screen
-        Gesture& g = gesture;
-        if (code == LV_EVENT_PRESSED) {
-          g = Gesture{};
-          g.edge = r >= EDGE_RADIUS;
-          g.start = p;
-          g.last_angle = angle;
-          g.t0 = millis();
-        } else if (code == LV_EVENT_PRESSING) {
-          if (g.edge) {
-            if (r < 40) return;  // the angle is meaningless near the centre
-            float d = angle - g.last_angle;
-            while (d > 180) d -= 360;
-            while (d < -180) d += 360;
-            g.last_angle = angle;
-            g.accum += d;
-            if (!g.dragging && fabsf(g.accum) > 8) g.dragging = true;
-            const int steps = static_cast<int>(g.accum / DEGREES_PER_PERCENT);
-            if (g.dragging && steps && volume_cb) {
-              g.accum -= steps * DEGREES_PER_PERCENT;
-              show_volume(volume_cb(steps));
-            }
-          } else if (abs(p.x - g.start.x) + abs(p.y - g.start.y) > 24) {
-            g.cancelled = true;  // a swipe, not a tap
-          }
-        } else if (code == LV_EVENT_RELEASED) {
-          if (!g.edge && !g.cancelled && millis() - g.t0 < 1000 && tap_cb) tap_cb();
-        }
-      },
-      LV_EVENT_ALL, nullptr);
+  lv_obj_add_event_cb(touch_layer, touch_event, LV_EVENT_ALL, reinterpret_cast<void*>(1));
 }
 
 int region_at(const lv_point_t& p) {
@@ -1506,6 +1512,7 @@ void open_view(View v) {
   media_panel = p_arc = p_kind = p_title = p_sub = p_play = p_repeat = p_sleep = nullptr;
   media_view = v;
   media_panel = full_panel();
+  lv_obj_add_event_cb(media_panel, touch_event, LV_EVENT_ALL, nullptr);  // volume around the edge, as at home
   if (v == View::Home) build_home();
   else if (v == View::List) build_list(false);
   else if (v == View::Tracks) build_list(true);
