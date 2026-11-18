@@ -80,22 +80,49 @@ void clearMusic();  // drops what's buffered (a new track, or stop)
 bool musicPlaying();  // music is coming out of the speaker now
 
 // Wake word arbitration (app.cpp): speakers that heard the wake word tell each other how loudly, above hearing.
-// A claim is three short tones: CLAIM_HZ[0]; CLAIM_HZ[1] exactly CLAIM_AB_MS later (the signature: a stray tone
-// can't pass for it); then CLAIM_HZ[2], CLAIM_BC_MS + level x CLAIM_SLOT_MS after that, which says how loud the
-// wake word was (level 0 the loudest, CLAIM_LEVELS - 1 the quietest).
-constexpr int CLAIM_HZ[3] = {18600, 19200, 19800};
-constexpr uint32_t CLAIM_TONE_MS = 30, CLAIM_AB_MS = 50, CLAIM_BC_MS = 40, CLAIM_SLOT_MS = 10;
-constexpr int CLAIM_LEVELS = 16;
-void claim(int level);        // plays our claim, at full level whatever the volume
-uint32_t claimMs(int level);  // how long it takes
+// A claim is three CLAIM_TONE_MS tones back to back: the signature CLAIM_SIGNATURE_HZ[0] then [1] (down in the band,
+// then up: no sweep or stray tone does that), then claimHz(level), whose pitch says how loud the wake word was
+// (level 0 the loudest, CLAIM_LEVELS - 1 the quietest). Each tone must last about CLAIM_TONE_MS, with nothing in the
+// band just before the first or after the last. The level is in a pitch, not in timing, so a claim can be read as soon
+// as it ends: the earlier three spaced-out tones took up to 260 ms to read, and two speakers' claims overlapped.
+constexpr int CLAIM_SIGNATURE_HZ[2] = {17400, 19800};
+constexpr int CLAIM_BASE_HZ = 18000, CLAIM_STEP_HZ = 300, CLAIM_LEVELS = 6;  // levels at 18.0 to 19.5 kHz
+constexpr uint32_t CLAIM_TONE_MS = 15;
+constexpr int claimHz(int level) { return CLAIM_BASE_HZ + level * CLAIM_STEP_HZ; }
+void claim(int level);  // plays our claim, at full level whatever the volume
+uint32_t claimMs();     // how long it takes
 struct HeardClaim {
-  uint32_t at = 0;    // millis() when it was heard (its last tone); 0 if none yet
+  uint32_t at = 0;    // millis() when it was heard (when it ended); 0 if none yet
   int level = -1;     // 0 = the loudest
-  int strength = 0;   // how strong its first tone was here (amplitude, out of 32767)
+  int strength = 0;   // how strong its weakest tone was here (amplitude, out of 32767)
 };
 HeardClaim lastClaim();  // the last claim heard from another speaker
+
+// For the logs: what the claim detector heard, so they show whether tones reach a speaker at all.
+struct ToneEvent {
+  enum Kind : uint8_t {
+    Claim,     // a whole claim (level)
+    Fragment,  // a tone in the band that didn't make up a claim (hz, ms)
+    Own,       // our own claim, as our microphone heard it (ms = how long after we played it; -1 if it never did)
+  } kind = Claim;
+  int hz = 0;
+  int level = 0;
+  int ms = 0;
+  int amplitude = 0;  // peak (out of 32767); for a claim, of its weakest tone
+  int noise = 0;      // the reference bands (16.8 and 20.4 kHz) at the time
+};
+bool takeToneEvent(ToneEvent& e);  // oldest first; false when there are none
+int droppedToneEvents();           // how many didn't fit in the queue, since the last call
+// The loudest the claim band got since the last call, outside our own claims, even below the detection threshold:
+// whether anything at all came through. Two readers (0 and 1) each get their own "since the last call".
+struct ClaimBand {
+  int amplitude = 0, hz = 0, noise = 0;
+};
+ClaimBand claimBandPeak(int reader);
+
 // The loudest 16 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
-int recentLevelDb();
+// `ago_ms`, if given, gets how long ago that was.
+int recentLevelDb(uint32_t* ago_ms = nullptr);
 // The microphone since the last call: average and loudest level (dBFS, per 16 ms) and the background noise floor
 // (mean absolute amplitude), for the logs.
 struct MicStats {

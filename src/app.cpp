@@ -1324,42 +1324,91 @@ void start_listening_turn(bool after_speech = false, bool follow_up = false, uin
 }
 
 // Wake word arbitration: when several speakers hear the wake word, only the one that heard it loudest answers.
-// Each turns how loud it heard the word into a level (0 the loudest, 2 dB a level), waits longer the higher its
-// level, then plays its claim (three tones above hearing that carry the level; audio.h) and answers. Strongest
-// wins:
+// Each waits ARBITRATION_MS_PER_DB for every dB it heard the word below ARBITRATION_LOUD_DB, then plays its claim
+// (three quick tones above hearing; the last one's pitch carries its level, 3 dB a level; audio.h) and answers. So
+// the loudest claims first, and the others hear it before their own turn comes. Strongest wins:
 // - before claiming, a speaker that hears a claim as strong as its own, or stronger, stays quiet;
 // - one that hears a weaker claim (that speaker caught the word sooner) claims at once;
 // - after claiming, a speaker that hears a stronger claim within CHALLENGE_MS stops answering and goes back to idle.
-constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: level 0
-constexpr int ARBITRATION_DB_PER_LEVEL = 2;
-constexpr uint32_t ARBITRATION_MS_PER_LEVEL = 25;
-constexpr uint32_t ARBITRATION_JITTER_MS = 20;  // two speakers at the same level rarely claim together
-constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;    // a claim heard this long before we caught the word still counts
-constexpr uint32_t CHALLENGE_MS = 1500;         // after our claim, a stronger one still takes over
+// A speaker can't hear claims while it plays its own (and CLAIM_ECHO_MS after), so the spacing must outlast the
+// trip from one speaker's claim to the other's decision: up to ~60 ms of output buffering, the 45 ms claim, and
+// ~25 ms of input. At 50 ms a dB, speakers 3 dB apart are 150 ms apart (in simulation one answers ~90% of the time,
+// always from 4 dB). Closer than that, both may still answer. The "came back after N ms" log line measures the real
+// output delay, for tuning this.
+constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: no wait, level 0
+constexpr int ARBITRATION_DB_PER_LEVEL = 3;
+constexpr uint32_t ARBITRATION_MS_PER_DB = 50;
+constexpr uint32_t ARBITRATION_JITTER_MS = 10;
+constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;  // a claim heard this long before we caught the word still counts
+constexpr uint32_t CHALLENGE_MS = 1500;       // after our claim, a stronger one still takes over
+constexpr uint32_t TONE_PROBE_MS = 1000;      // after a wake word, log the loudest the claim band got
 int my_level = 0;
 uint32_t claimed_at = 0;  // when we claimed; 0 = no claim of ours in play
+uint32_t tone_probe_until = 0;
 
-int level_for(int db) {
-  return constrain((ARBITRATION_LOUD_DB - db + ARBITRATION_DB_PER_LEVEL - 1) / ARBITRATION_DB_PER_LEVEL, 0,
-                   audio::CLAIM_LEVELS - 1);
+int db_below_loud(int db) {
+  return constrain(ARBITRATION_LOUD_DB - db, 0, ARBITRATION_DB_PER_LEVEL * audio::CLAIM_LEVELS - 1);
+}
+
+int level_for(int db) { return db_below_loud(db) / ARBITRATION_DB_PER_LEVEL; }
+
+float khz(int hz) { return hz / 1000.0f; }
+
+// What the claim detector heard (audio.h), so the logs show whether tones reach this speaker at all.
+void log_tones() {
+  audio::ToneEvent e;
+  while (audio::takeToneEvent(e)) {
+    switch (e.kind) {
+      case audio::ToneEvent::Claim:
+        LOGI(TAG, "tone: claim, level %d (%.1f kHz), %d ms, weakest tone amplitude %d, noise %d", e.level, khz(e.hz),
+             e.ms, e.amplitude, e.noise);
+        break;
+      case audio::ToneEvent::Fragment:
+        LOGI(TAG, "tone: %.1f kHz for %d ms, amplitude %d, noise %d (not part of a claim)", khz(e.hz), e.ms,
+             e.amplitude, e.noise);
+        break;
+      case audio::ToneEvent::Own:
+        if (e.ms >= 0) {
+          LOGI(TAG, "tone: our own claim came back after %d ms at amplitude %d at %.1f kHz, noise %d", e.ms,
+               e.amplitude, khz(e.hz), e.noise);
+        } else {
+          LOGI(TAG, "tone: our own claim didn't come back (loudest %d at %.1f kHz, noise %d): is the tone playing, "
+                    "does the mic hear it?", e.amplitude, khz(e.hz), e.noise);
+        }
+        break;
+    }
+  }
+  if (const int dropped = audio::droppedToneEvents()) LOGI(TAG, "tone: %d more not logged", dropped);
+  if (tone_probe_until && static_cast<int32_t>(millis() - tone_probe_until) >= 0) {
+    tone_probe_until = 0;
+    const audio::ClaimBand b = audio::claimBandPeak(0);
+    LOGI(TAG, "tone: loudest in the claim band in the %u ms after the wake word: amplitude %d at %.1f kHz, noise %d "
+              "(a claim needs over 30 and 4x the noise)",
+         static_cast<unsigned>(TONE_PROBE_MS), b.amplitude, khz(b.hz), b.noise);
+  }
 }
 
 void arbitrate() {
-  const int db = audio::recentLevelDb();
+  uint32_t ago = 0;
+  const int db = audio::recentLevelDb(&ago);
   my_level = level_for(db);
   claimed_at = 0;
-  uint32_t wait = my_level * ARBITRATION_MS_PER_LEVEL + esp_random() % ARBITRATION_JITTER_MS;
+  audio::claimBandPeak(0);  // start the probe afresh
+  tone_probe_until = millis() + TONE_PROBE_MS;
+  uint32_t wait = db_below_loud(db) * ARBITRATION_MS_PER_DB + esp_random() % ARBITRATION_JITTER_MS;
   const audio::HeardClaim heard = audio::lastClaim();
   if (heard.at && millis() - heard.at < CLAIM_LOOKBACK_MS) {
     if (heard.level <= my_level) {
-      LOGI(TAG, "wake word at %d dBFS (level %d): another speaker heard it at level %d and is answering; staying quiet",
-           db, my_level, heard.level);
+      LOGI(TAG, "wake word at %d dBFS (level %d, loudest %u ms before detection): another speaker claimed at level %d "
+                "%u ms ago and is answering; staying quiet",
+           db, my_level, static_cast<unsigned>(ago), heard.level, static_cast<unsigned>(millis() - heard.at));
       return;
     }
     wait = 0;  // we heard it better than the speaker answering: take over
   }
-  LOGI(TAG, "wake word at %d dBFS (level %d): answering in %u ms unless a closer speaker does", db, my_level,
-       static_cast<unsigned>(wait));
+  LOGI(TAG, "wake word at %d dBFS (level %d, loudest %u ms before detection): answering in %u ms unless a closer "
+            "speaker does",
+       db, my_level, static_cast<unsigned>(ago), static_cast<unsigned>(wait));
   arbitration_started = millis();
   voice = Voice::Arbitrating;
   voice_at = millis() + wait;
@@ -1384,6 +1433,7 @@ void stand_down(const audio::HeardClaim& other) {
 }
 
 void update_arbitration() {
+  log_tones();
   const audio::HeardClaim heard = audio::lastClaim();
   if (voice == Voice::Arbitrating) {
     if (heard.at && static_cast<int32_t>(heard.at - arbitration_started) >= 0) {
@@ -1397,7 +1447,8 @@ void update_arbitration() {
       audio::claim(my_level);  // tell the others, then answer
       claimed_at = millis() | 1;
       board::markActivity();
-      start_listening_turn(false, false, audio::claimMs(my_level));
+      LOGI(TAG, "wake word: claiming at level %d (%.1f kHz)", my_level, khz(audio::claimHz(my_level)));
+      start_listening_turn(false, false, audio::claimMs());
     }
   } else if (claimed_at) {
     if (voice == Voice::Off || millis() - claimed_at > CHALLENGE_MS) {
@@ -1816,8 +1867,15 @@ void update_voice() {
     last_stats = millis();
     const wakeword::Stats st = wakeword::stats();
     const audio::MicStats mic = audio::micStats();
-    LOGI(TAG, "mic (%s kHz): average %d dBFS, loudest %d dBFS, noise floor %d", audio::ultrasonic() ? "48" : "16",
-         mic.average_db, mic.loudest_db, mic.noise_floor);
+    if (audio::ultrasonic()) {
+      const audio::ClaimBand band = audio::claimBandPeak(1);
+      LOGI(TAG, "mic (48 kHz): average %d dBFS, loudest %d dBFS, noise floor %d; claim band loudest %d at %.1f kHz, "
+                "noise %d",
+           mic.average_db, mic.loudest_db, mic.noise_floor, band.amplitude, khz(band.hz), band.noise);
+    } else {
+      LOGI(TAG, "mic (16 kHz): average %d dBFS, loudest %d dBFS, noise floor %d", mic.average_db, mic.loudest_db,
+           mic.noise_floor);
+    }
     LOGI(TAG, "wake word: %u inferences in the last minute, %u us each, highest %u%%", st.inferences,
          st.avg_infer_us, static_cast<unsigned>(st.max_probability * 100));
   }

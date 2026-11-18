@@ -237,37 +237,33 @@ void write_samples(const int16_t* data, size_t count) {  // 16 kHz
   }
 }
 
-// Our claim (audio.h): three tones with soft edges (no clicks), at full level whatever the volume.
+// Our claim (audio.h): three tones back to back, the pitch changing without a jump in phase, soft edges only at the
+// very start and end (no clicks), at full level whatever the volume.
 volatile uint32_t claiming_until = 0;  // the capture task ignores what it hears of our own claim
 volatile int claim_level = 0;          // for the queued Sound::Claim
-
-uint32_t claim_start_ms(int tone, int level) {
-  return tone == 0 ? 0 : tone == 1 ? CLAIM_AB_MS : CLAIM_AB_MS + CLAIM_BC_MS + level * CLAIM_SLOT_MS;
-}
+volatile uint32_t claim_started = 0;   // millis() when we began writing our claim
+constexpr uint32_t CLAIM_ECHO_MS = 150;  // after the last write: what's still in the DMA buffers, and the echo
 
 void render_claim(int level) {
   static int16_t buf[CHUNK * RATIO];
-  const uint32_t tone_len = HW_RATE * CLAIM_TONE_MS / 1000, ramp = HW_RATE * 5 / 1000;
-  uint32_t start[3];
-  for (int t = 0; t < 3; t++) start[t] = HW_RATE * claim_start_ms(t, level) / 1000;
-  const uint32_t total = start[2] + tone_len;
-  claiming_until = millis() + total * 1000 / HW_RATE + 150;
+  const int pitch[3] = {CLAIM_SIGNATURE_HZ[0], CLAIM_SIGNATURE_HZ[1], claimHz(level)};
+  const uint32_t tone = HW_RATE * CLAIM_TONE_MS / 1000, total = 3 * tone, ramp = HW_RATE * 2 / 1000;
+  claim_started = millis();
+  claiming_until = claim_started + claimMs() + CLAIM_ECHO_MS;
   wr(0x32, 0xBF);  // DAC at 0 dB for the tones
+  float phase = 0;
   for (uint32_t i = 0; i < total;) {
     const size_t m = min<uint32_t>(CHUNK * RATIO, total - i);
     for (size_t k = 0; k < m; k++, i++) {
-      float v = 0;
-      for (int t = 0; t < 3; t++) {
-        if (i < start[t] || i >= start[t] + tone_len) continue;
-        const uint32_t at = i - start[t], edge = min(at, tone_len - 1 - at);
-        const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
-        v = 23000.0f * env * sinf(2.0f * PI * CLAIM_HZ[t] * at / HW_RATE);
-      }
-      buf[k] = static_cast<int16_t>(v);
+      phase += 2.0f * PI * pitch[i / tone] / HW_RATE;
+      if (phase > 2.0f * PI) phase -= 2.0f * PI;
+      const uint32_t edge = min(i, total - 1 - i);
+      const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
+      buf[k] = static_cast<int16_t>(23000.0f * env * sinf(phase));
     }
     write_raw(buf, m);
   }
-  claiming_until = millis() + 150;  // what's still in the DMA buffers, and the echo
+  claiming_until = millis() + CLAIM_ECHO_MS;
 }
 
 void render(const Note* notes) {
@@ -459,19 +455,49 @@ bool is_speech(const int16_t* s, size_t n) {
   return speech;
 }
 
-// Listening for other speakers' claims in the 48 kHz audio: Goertzel filters at the three tones and at a reference
-// frequency below them, over 5 ms blocks. A tone starts when it's the strongest of the three, well above the
-// reference (broadband noise) and a minimum level, for 3 blocks in a row; a claim is the three starting in order, the
-// second CLAIM_AB_MS after the first, the third CLAIM_BC_MS plus its level's slots after that.
+// Listening for other speakers' claims in the 48 kHz audio: a Goertzel filter at each of the eight claim pitches
+// (the two signature pitches and the six levels) and at two reference frequencies outside them, over 5 ms blocks.
+// A block has a tone when one pitch is the strongest, above a minimum level and well above both references
+// (broadband noise). A run is consecutive blocks with the same pitch; a claim is three runs, signature then signature
+// then a level, each about a tone long, at most a block apart (a block straddling two tones may be neither), with
+// quiet before the first. It's read when the last run ends into quiet.
 constexpr int BLOCK_MS = 5;
 constexpr int TONE_BLOCK = HW_RATE * BLOCK_MS / 1000;
-constexpr int REF_HZ = 17000;
+constexpr int PITCHES = CLAIM_LEVELS + 2;  // [0] signature 1, [1..6] levels 0..5, [7] signature 2
+constexpr int SIG_FIRST = 0, SIG_SECOND = PITCHES - 1;
+constexpr int REF_LOW_HZ = 16800, REF_HIGH_HZ = 20400;  // 600 Hz outside the outermost pitches
 constexpr float TONE_MIN_AMP = 30.0f;  // out of 32767
 constexpr float TONE_OVER_REF = 4.0f;
-constexpr int ONSET_BLOCKS = 3;
-constexpr int32_t SLACK_MS = 12;  // timing tolerance
+constexpr int MIN_RUN_BLOCKS = 2;   // a 15 ms tone covers 2 to 4 blocks, depending on how they line up
+constexpr int MAX_RUN_BLOCKS = 4;
+constexpr int MAX_GAP_BLOCKS = 1;   // between the tones of a claim
+constexpr int QUIET_BEFORE_BLOCKS = 2;
+constexpr int LOG_RUN_BLOCKS = 2;   // shorter runs are noise, too many to log
+constexpr int FLUSH_BLOCKS = 20;    // runs this old can't start a claim any more: log them as fragments
+
+int pitch_hz(int p) {
+  return p == SIG_FIRST ? CLAIM_SIGNATURE_HZ[0] : p == SIG_SECOND ? CLAIM_SIGNATURE_HZ[1] : claimHz(p - 1);
+}
+
 portMUX_TYPE heard_lock = portMUX_INITIALIZER_UNLOCKED;
 HeardClaim heard;
+
+// What the detector heard, for the logs (takeToneEvent). Filled by the capture task, emptied by the main loop.
+constexpr int TONE_EVENTS = 16;
+ToneEvent tone_events[TONE_EVENTS];
+int tone_head = 0, tone_count = 0, tone_dropped = 0;
+ClaimBand band_peak[2];  // claimBandPeak(): one per reader
+
+void push_tone_event(const ToneEvent& e) {
+  portENTER_CRITICAL(&heard_lock);
+  if (tone_count < TONE_EVENTS) {
+    tone_events[(tone_head + tone_count) % TONE_EVENTS] = e;
+    tone_count++;
+  } else {
+    tone_dropped++;
+  }
+  portEXIT_CRITICAL(&heard_lock);
+}
 
 struct Goertzel {
   float coeff, s1 = 0, s2 = 0;
@@ -488,60 +514,156 @@ struct Goertzel {
   }
 };
 
-// A tone started (at `t` ms, on the block clock): advance through the claim's three tones.
-void tone_started(int tone, int32_t t, float amp) {
-  static int stage = 0;  // tones of a claim seen so far
-  static int32_t t_a = 0, t_b = 0;
-  static float strength = 0;
-  if (stage && t - (stage == 1 ? t_a : t_b) > 400) stage = 0;  // too long since: start over
-  if (tone == 0) {
-    stage = 1;
-    t_a = t;
-    strength = amp;
-  } else if (tone == 1 && stage == 1 && abs(t - t_a - static_cast<int32_t>(CLAIM_AB_MS)) <= SLACK_MS) {
-    stage = 2;
-    t_b = t;
-  } else if (tone == 2 && stage == 2) {
-    const int32_t delay = t - t_b - CLAIM_BC_MS;
-    const int level = (delay + static_cast<int32_t>(CLAIM_SLOT_MS) / 2) / static_cast<int32_t>(CLAIM_SLOT_MS);
-    if (delay >= -SLACK_MS && level < CLAIM_LEVELS) {
-      HeardClaim c;
-      c.at = millis() | 1;  // never 0
-      c.level = max(level, 0);
-      c.strength = static_cast<int>(strength);
-      portENTER_CRITICAL(&heard_lock);
-      heard = c;
-      portEXIT_CRITICAL(&heard_lock);
-    }
-    stage = 0;
-  } else {
-    stage = 0;  // out of order: not a claim
+// A run of blocks with one pitch, for the claim matcher.
+struct Run {
+  int pitch = -1;
+  int32_t start = 0;  // block number
+  int blocks = 0;
+  int32_t gap_before = 1 << 20;  // quiet blocks between the previous run and this one
+  float peak = 0, noise = 0;
+  int32_t end() const { return start + blocks; }
+};
+
+void log_fragment(const Run& r) {
+  if (r.blocks < LOG_RUN_BLOCKS) return;
+  ToneEvent e;
+  e.kind = ToneEvent::Fragment;
+  e.hz = pitch_hz(r.pitch);
+  e.ms = r.blocks * BLOCK_MS;
+  e.amplitude = static_cast<int>(r.peak);
+  e.noise = static_cast<int>(r.noise);
+  push_tone_event(e);
+}
+
+// The last three runs; a claim is the three of them, in order.
+Run runs[3];
+int run_count = 0;
+int32_t last_run_end = -(1 << 20);
+
+void flush_runs() {
+  for (int i = 0; i < run_count; i++) log_fragment(runs[i]);
+  run_count = 0;
+}
+
+bool tone_length(const Run& r) { return r.blocks >= MIN_RUN_BLOCKS && r.blocks <= MAX_RUN_BLOCKS; }
+
+// A run just ended; `quiet_after`: the block that ended it had no tone.
+void run_ended(Run r, bool quiet_after) {
+  r.gap_before = r.start - last_run_end;
+  last_run_end = r.end();
+  if (run_count == 3) {  // the oldest can't be part of a claim any more
+    log_fragment(runs[0]);
+    runs[0] = runs[1];
+    runs[1] = runs[2];
+    run_count = 2;
   }
+  runs[run_count++] = r;
+  if (run_count < 3 || !quiet_after) return;
+  const Run &a = runs[0], &b = runs[1], &c = runs[2];
+  if (a.pitch != SIG_FIRST || b.pitch != SIG_SECOND || c.pitch == SIG_FIRST || c.pitch == SIG_SECOND) return;
+  if (a.gap_before < QUIET_BEFORE_BLOCKS || b.gap_before > MAX_GAP_BLOCKS || c.gap_before > MAX_GAP_BLOCKS) return;
+  if (!tone_length(a) || !tone_length(b) || !tone_length(c)) return;
+  ToneEvent e;
+  e.kind = ToneEvent::Claim;
+  e.level = c.pitch - 1;
+  e.hz = pitch_hz(c.pitch);
+  e.ms = (c.end() - a.start) * BLOCK_MS;
+  e.amplitude = static_cast<int>(min(a.peak, min(b.peak, c.peak)));
+  e.noise = static_cast<int>(max(a.noise, max(b.noise, c.noise)));
+  HeardClaim h;
+  h.at = millis() | 1;  // never 0
+  h.level = e.level;
+  h.strength = e.amplitude;
+  portENTER_CRITICAL(&heard_lock);
+  heard = h;
+  portEXIT_CRITICAL(&heard_lock);
+  push_tone_event(e);
+  run_count = 0;  // used up
 }
 
 void listen_for_claims(const int16_t* raw, size_t n) {
-  static Goertzel tones[3] = {Goertzel(CLAIM_HZ[0]), Goertzel(CLAIM_HZ[1]), Goertzel(CLAIM_HZ[2])};
-  static Goertzel ref(REF_HZ);
+  static Goertzel tones[PITCHES] = {Goertzel(pitch_hz(0)), Goertzel(pitch_hz(1)), Goertzel(pitch_hz(2)),
+                                    Goertzel(pitch_hz(3)), Goertzel(pitch_hz(4)), Goertzel(pitch_hz(5)),
+                                    Goertzel(pitch_hz(6)), Goertzel(pitch_hz(7))};
+  static_assert(PITCHES == 8, "one Goertzel filter per claim pitch");
+  static Goertzel ref_low(REF_LOW_HZ), ref_high(REF_HIGH_HZ);
   static int count = 0;
   static int32_t block = 0;
-  static int run[3] = {0, 0, 0};
+  static Run cur;  // the run in progress (blocks == 0: none)
+  static bool was_ours = false;
+  static float own_peak = 0, own_noise = 0;  // our own claim, as our microphone hears it
+  static int own_pitch = 0;
+  static uint32_t own_heard = 0;  // millis() when it first came back
   for (size_t i = 0; i < n; i++) {
-    for (Goertzel& g : tones) g.add(raw[i]);
-    ref.add(raw[i]);
+    const float x = raw[i];
+    for (Goertzel& g : tones) g.add(x);
+    ref_low.add(x);
+    ref_high.add(x);
     if (++count < TONE_BLOCK) continue;
     count = 0;
     block++;
-    float amp[3];
+    float amp[PITCHES];
     int best = 0;
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < PITCHES; t++) {
       amp[t] = tones[t].amplitude();
       if (amp[t] > amp[best]) best = t;
     }
-    const float r = ref.amplitude();
+    const float r = max(ref_low.amplitude(), ref_high.amplitude());
+    const bool present = amp[best] > TONE_MIN_AMP && amp[best] > TONE_OVER_REF * r;
     const bool ours = static_cast<int32_t>(claiming_until - millis()) > 0;
-    const bool present = !ours && amp[best] > TONE_MIN_AMP && amp[best] > TONE_OVER_REF * r;
-    for (int t = 0; t < 3; t++) run[t] = present && t == best ? run[t] + 1 : 0;
-    if (present && run[best] == ONSET_BLOCKS) tone_started(best, (block - ONSET_BLOCKS + 1) * BLOCK_MS, amp[best]);
+    if (ours) {
+      // Our own claim: not anyone else's, but how loud and how soon it comes back shows the tones play and the
+      // microphone hears this band.
+      if (!was_ours) {
+        own_peak = own_noise = 0;
+        own_heard = 0;
+        cur.blocks = 0;  // whatever was in progress is cut short by our claim
+        flush_runs();
+      }
+      if (!own_heard && present) own_heard = millis() | 1;
+      if (amp[best] > own_peak) {
+        own_peak = amp[best];
+        own_pitch = best;
+      }
+      own_noise = max(own_noise, r);
+      last_run_end = block;  // nothing during our claim counts as quiet before someone else's
+      was_ours = true;
+      continue;
+    }
+    if (was_ours) {
+      ToneEvent e;
+      e.kind = ToneEvent::Own;
+      e.hz = pitch_hz(own_pitch);
+      e.amplitude = static_cast<int>(own_peak);
+      e.noise = static_cast<int>(own_noise);
+      e.ms = own_heard ? static_cast<int>(own_heard - claim_started) : -1;  // the round trip, speaker to microphone
+      push_tone_event(e);
+      was_ours = false;
+    }
+    for (ClaimBand& b : band_peak) {  // a race with claimBandPeak() at worst skews one log line
+      if (amp[best] > b.amplitude) {
+        b.amplitude = static_cast<int>(amp[best]);
+        b.hz = pitch_hz(best);
+        b.noise = static_cast<int>(r);
+      }
+    }
+    if (present && cur.blocks && best == cur.pitch) {
+      cur.blocks++;
+      cur.peak = max(cur.peak, amp[best]);
+      cur.noise = max(cur.noise, r);
+      continue;
+    }
+    if (cur.blocks) run_ended(cur, !present);
+    cur.blocks = 0;
+    if (present) {
+      cur.pitch = best;
+      cur.start = block;
+      cur.blocks = 1;
+      cur.peak = amp[best];
+      cur.noise = r;
+    } else if (run_count && block - last_run_end > FLUSH_BLOCKS) {
+      flush_runs();
+    }
   }
 }
 
@@ -651,7 +773,7 @@ uint32_t soundMs(Sound sound) {
     f.close();
     return ms;
   }
-  if (sound == Sound::Claim) return claimMs(claim_level);
+  if (sound == Sound::Claim) return claimMs();
   uint32_t ms = 0;
   for (const Note* n = notes_for(sound); n->ms; n++) ms += n->ms;
   return ms;
@@ -802,7 +924,34 @@ void claim(int level) {
   xQueueSend(queue, &s, 0);
 }
 
-uint32_t claimMs(int level) { return claim_start_ms(2, constrain(level, 0, CLAIM_LEVELS - 1)) + CLAIM_TONE_MS; }
+uint32_t claimMs() { return 3 * CLAIM_TONE_MS; }
+
+bool takeToneEvent(ToneEvent& e) {
+  portENTER_CRITICAL(&heard_lock);
+  const bool any = tone_count > 0;
+  if (any) {
+    e = tone_events[tone_head];
+    tone_head = (tone_head + 1) % TONE_EVENTS;
+    tone_count--;
+  }
+  portEXIT_CRITICAL(&heard_lock);
+  return any;
+}
+
+int droppedToneEvents() {
+  portENTER_CRITICAL(&heard_lock);
+  const int n = tone_dropped;
+  tone_dropped = 0;
+  portEXIT_CRITICAL(&heard_lock);
+  return n;
+}
+
+ClaimBand claimBandPeak(int reader) {
+  ClaimBand& slot = band_peak[reader & 1];
+  const ClaimBand b = slot;
+  slot = ClaimBand();
+  return b;
+}
 
 HeardClaim lastClaim() {
   portENTER_CRITICAL(&heard_lock);
@@ -823,9 +972,16 @@ MicStats micStats() {
   return s;
 }
 
-int recentLevelDb() {
+int recentLevelDb(uint32_t* ago_ms) {
   uint16_t loudest = 1;
-  for (uint16_t l : levels) loudest = max(loudest, l);
+  size_t at = level_at;
+  for (size_t i = 0; i < LEVELS; i++) {
+    if (levels[i] > loudest) {
+      loudest = levels[i];
+      at = i;
+    }
+  }
+  if (ago_ms) *ago_ms = ((level_at + LEVELS - at - 1) % LEVELS) * CHUNK * 1000 / SAMPLE_RATE;
   return static_cast<int>(lroundf(20.0f * log10f(loudest / 32767.0f)));
 }
 

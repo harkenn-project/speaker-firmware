@@ -39,10 +39,12 @@ supported.
    while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
    in the config.
 6. **Only the nearest answers.** When several speakers hear the wake word, the one that heard it loudest answers.
-   Each plays a *claim* the others can hear but people can't: three short tones between 18.6 and 19.8 kHz, the first
-   two a fixed 50 ms apart (so a stray tone can't pass for one), the third later the quieter the speaker heard the
-   word. Strongest wins: the others stay quiet, or stop if they'd started (Harkenn's `audio.wake_arbitration`, on by
-   default). The codec runs at 48 kHz for this, filtered to 16 kHz for everything else.
+   Each waits longer the quieter it heard the word, then plays a *claim* the others can hear but people can't: three
+   15 ms tones back to back, 17.4 kHz then 19.8 kHz (a signature a stray tone or sweep can't match), then a pitch
+   between 18.0 and 19.5 kHz that says how loud it heard the word. Strongest wins: the others stay quiet, or stop if
+   they'd started (Harkenn's `audio.wake_arbitration`, on by default). It works without Harkenn. The codec runs at
+   48 kHz for this, filtered to 16 kHz for everything else. Speakers log every tone they hear (`tone:` lines) and
+   how their own claim sounds to their own microphone, so you can check the tones carry between them.
 7. **Away from home.** Set up for remote connection (in Harkenn), a speaker that can't find Harkenn for 2 minutes
    goes through the relay instead (see [RELAY.md](https://github.com/harkenn-project/server-docker/blob/main/docs/RELAY.md)):
    the same conversation, end-to-end encrypted so the relay can't read it, with animations, sounds and firmware
