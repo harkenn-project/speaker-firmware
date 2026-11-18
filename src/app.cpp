@@ -721,6 +721,7 @@ String wake_model_url;  // the model loaded now
 
 bool apply_wake_word(JsonVariantConst w) {
   const String url = w["url"] | "";
+  wakeword::setClips(!w.isNull() && (w["clips"] | false));  // send Harkenn what set it off (send_wake_clip)
   if (w.isNull() || !url.length()) {
     if (wakeword::loaded()) LOGI(TAG, "wake word off");
     wakeword::unload();
@@ -1719,6 +1720,34 @@ void update_timers() {
   if (timers::version() != timers_sent) send_timers();
 }
 
+// Wake clips (config wake_word.clips): what the wake word heard up to its last detection, sent once the speaker is
+// idle again so the conversation isn't held up. Harkenn keeps them, so false wakes can be found and trained away.
+void send_wake_clip() {
+  static int16_t* pcm = nullptr;  // PSRAM, on first use
+  if (!pcm) pcm = static_cast<int16_t*>(heap_caps_malloc(wakeword::CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (!pcm) return;
+  float probability = 0;
+  const size_t n = wakeword::takeClip(pcm, &probability);
+  if (!n) return;
+  JsonDocument doc;
+  doc["type"] = "wake_clip";
+  doc["rate"] = audio::SAMPLE_RATE;
+  doc["bytes"] = n * sizeof(int16_t);
+  doc["probability"] = roundf(probability * 1000) / 1000;
+  send_json(doc);
+  // its audio straight after, nothing in between (Harkenn drops a clip that another message interrupts)
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(pcm);
+  const size_t total = n * sizeof(int16_t);
+  for (size_t at = 0; at < total; at += 4096) {
+    if (!send_frame('B', p + at, min<size_t>(4096, total - at))) {
+      LOGW(TAG, "wake clip not sent");
+      return;
+    }
+  }
+  LOGI(TAG, "wake clip sent: %u ms, probability %u%%", static_cast<unsigned>(n / 16),
+       static_cast<unsigned>(probability * 100));
+}
+
 void update_voice() {
   if (tap_requested) {
     tap_requested = false;
@@ -1735,6 +1764,7 @@ void update_voice() {
   } else if (woke && ws_connected) {
     wake_word_heard();
   }
+  if (voice == Voice::Off && ws_connected) send_wake_clip();  // the last detection's, if there's one to send
   static uint32_t last_stats = 0;
   if (wakeword::loaded() && millis() - last_stats > 60000) {
     last_stats = millis();

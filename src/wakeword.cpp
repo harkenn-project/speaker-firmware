@@ -5,6 +5,8 @@
 #include <freertos/idf_additions.h>
 #include <freertos/stream_buffer.h>
 
+#include <utility>
+
 #include "logbuf.h"
 #include "tensorflow/lite/experimental/microfrontend/lib/frontend.h"
 #include "tensorflow/lite/experimental/microfrontend/lib/frontend_util.h"
@@ -91,6 +93,31 @@ volatile bool detected = false, stop_detected = false;
 Stats stats_now;
 uint64_t infer_us_total = 0;
 
+// Wake clips (setClips): what the wake word heard lately, in a ring, and a copy of it at the last detection. Guarded
+// by `lock`; PSRAM, allocated only while on.
+int16_t* ring = nullptr;
+size_t ring_at = 0, ring_filled = 0;
+int16_t* clip = nullptr;
+volatile size_t clip_len = 0;  // read without the lock by takeClip(), to skip it cheaply when there's nothing
+float clip_probability = 0;
+
+void ring_add(const int16_t* s, size_t n) {
+  if (!ring) return;
+  for (size_t i = 0; i < n; i++) {
+    ring[ring_at] = s[i];
+    ring_at = (ring_at + 1) % CLIP_SAMPLES;
+  }
+  ring_filled = min(ring_filled + n, CLIP_SAMPLES);
+}
+
+void snapshot_clip(float probability) {
+  if (!ring || !clip) return;
+  const size_t start = (ring_at + CLIP_SAMPLES - ring_filled) % CLIP_SAMPLES;
+  for (size_t i = 0; i < ring_filled; i++) clip[i] = ring[(start + i) % CLIP_SAMPLES];
+  clip_len = ring_filled;
+  clip_probability = probability;
+}
+
 void free_model(Model* m) {
   if (!m) return;
   delete m->interpreter;  // the allocator and variables live in the arena
@@ -112,6 +139,7 @@ void reset_model(Model* m) {
 // listening resumes, and wake again.
 void reset_stream() {
   if (frontend_ok) FrontendReset(&frontend);
+  ring_filled = 0;  // a clip starts where listening resumed
   reset_model(model);
   reset_model(stop_model);
   detected = false;
@@ -141,6 +169,7 @@ bool step(Model& m, const int8_t* features, bool count_stats) {
   for (int i = 0; i < m.window; i++) sum += m.recent[i];
   if (sum >= static_cast<uint32_t>(m.cutoff) * m.window && static_cast<int32_t>(millis() - m.quiet_until) >= 0) {
     LOGI(TAG, "%s (average %u%%)", count_stats ? "wake word" : "stop", static_cast<unsigned>(sum * 100 / (255 * m.window)));
+    if (count_stats) snapshot_clip(static_cast<float>(sum) / (255.0f * m.window));
     m.quiet_until = millis() + REFRACTORY_MS;
     memset(m.recent, 0, sizeof(m.recent));
     return true;
@@ -161,6 +190,7 @@ void task(void*) {
     if (!resumed && (!n || !on)) continue;
     xSemaphoreTake(lock, portMAX_DELAY);
     if (resumed) reset_stream();  // a fresh start after a pause: no stale audio
+    if (listening && model) ring_add(buf, n / sizeof(int16_t));
     if (frontend_ok) {
       const int16_t* p = buf;
       size_t left = n / sizeof(int16_t);
@@ -296,6 +326,43 @@ bool takeDetection() {
   if (!detected) return false;
   detected = false;
   return true;
+}
+
+void setClips(bool on) {
+  if (on == (ring != nullptr) || !lock) return;
+  int16_t* r = nullptr;
+  int16_t* c = nullptr;
+  if (on) {
+    r = static_cast<int16_t*>(heap_caps_malloc(CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    c = static_cast<int16_t*>(heap_caps_malloc(CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    if (!r || !c) {
+      LOGW(TAG, "no memory for wake clips");
+      heap_caps_free(r);
+      heap_caps_free(c);
+      return;
+    }
+  }
+  xSemaphoreTake(lock, portMAX_DELAY);
+  std::swap(ring, r);
+  std::swap(clip, c);
+  ring_at = ring_filled = clip_len = 0;
+  xSemaphoreGive(lock);
+  heap_caps_free(r);  // the old buffers, when turning off
+  heap_caps_free(c);
+  LOGI(TAG, "wake clips %s", on ? "on" : "off");
+}
+
+size_t takeClip(int16_t* out, float* probability) {
+  if (!lock || !clip_len) return 0;  // called every loop: no lock unless there's a clip
+  xSemaphoreTake(lock, portMAX_DELAY);
+  const size_t n = clip ? clip_len : 0;
+  if (n) {
+    memcpy(out, clip, n * sizeof(int16_t));
+    if (probability) *probability = clip_probability;
+    clip_len = 0;
+  }
+  xSemaphoreGive(lock);
+  return n;
 }
 
 bool takeStop() {

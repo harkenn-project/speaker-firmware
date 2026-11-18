@@ -28,6 +28,14 @@ void feed(const int16_t* samples, size_t count);  // from the audio task; never 
 void setListening(bool on);  // pause (false) while the speaker is busy, so it doesn't wake itself up
 bool takeDetection();        // true once per detection
 
+// Wake clips: while on, the last CLIP_SAMPLES of audio the wake word heard are kept (in PSRAM), and copied at every
+// detection, so Harkenn can be sent what set it off (false wakes become training data).
+constexpr size_t CLIP_SAMPLES = 3 * 16000;
+void setClips(bool on);
+// The newest clip not taken yet, into `out` (room for CLIP_SAMPLES), oldest sample first; its length in samples, or
+// 0 if there's none. `probability` gets the detection's averaged probability (0-1).
+size_t takeClip(int16_t* out, float* probability);
+
 struct Stats {
   uint32_t inferences = 0;
   uint32_t avg_infer_us = 0;
