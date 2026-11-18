@@ -217,6 +217,7 @@ const Note* notes_for(Sound s) {
     case Sound::Alarm: return ALARM;
     case Sound::Notify: return NOTIFY;
     case Sound::ToneTest: return TICK;  // played by render_tone_test()
+    case Sound::Warm: return TICK;      // plays nothing
   }
   return TICK;
 }
@@ -383,12 +384,16 @@ constexpr size_t SPEECH_BUFFER_BYTES = 512 * 1024;  // 16 s; Harkenn stays at mo
 StreamBufferHandle_t speech = nullptr;
 volatile bool speech_on = false, speech_ending = false;
 
+// The amplifier is off between sounds; switched on, it gets AMP_WAKE_MS (audio.h) before anything plays. With 5 ms, a
+// 45 ms claim came out silent (0.16.0-development.7's tone test heard the same claim loud once the amp was warm).
+volatile uint32_t amp_hold_until = 0;  // warmUp(): keep it on until then, though nothing plays
+
 void amp(bool on) {
   static bool is_on = false;
   if (on == is_on) return;
   digitalWrite(pins::AMP_EN, on ? HIGH : LOW);
   is_on = on;
-  if (on) delay(5);
+  if (on) delay(AMP_WAKE_MS);
 }
 
 // The sound pack's clips, in flash: /<slot>.pcm, and /<slot>.url with where it came from.
@@ -461,6 +466,10 @@ void play_task(void*) {
     Sound s;
     const bool music_due = music && xStreamBufferBytesAvailable(music) && (!music_holds || music_level > 0);
     if (xQueueReceive(queue, &s, speech_on || music_due ? 0 : pdMS_TO_TICKS(music ? 10 : AMP_OFF_AFTER_MS)) == pdTRUE) {
+      if (s == Sound::Warm) {
+        amp(true);
+        continue;
+      }
       if (s == Sound::Claim || s == Sound::ToneTest) {  // played whatever the volume
         sound_playing = true;
         amp(true);
@@ -496,6 +505,7 @@ void play_task(void*) {
     if (play_music()) continue;
     if (!quiet_since) quiet_since = millis() | 1;
     if (millis() - quiet_since < AMP_OFF_AFTER_MS) continue;  // let the DMA buffers drain (or music catch up)
+    if (static_cast<int32_t>(amp_hold_until - millis()) > 0) continue;  // warmUp(): a claim is coming
     amp(false);
   }
 }
@@ -1021,8 +1031,15 @@ void claim(int level) {
 
 uint32_t claimMs() { return 3 * CLAIM_TONE_MS; }
 
+void warmUp(uint32_t ms) {
+  if (!ok || ratio != RATIO) return;
+  amp_hold_until = millis() + ms;
+  const Sound s = Sound::Warm;
+  xQueueSendToFront(queue, &s, 0);
+}
+
 bool startToneTest(bool play) {
-  if (!ok || ratio != RATIO || mic_muted || test_t0) return false;
+  if (!ok || ratio != RATIO || (mic_muted && !play) || test_t0) return false;
   test = ToneTest();
   test.played = play;
   for (int& b : test.back_ms) b = -1;

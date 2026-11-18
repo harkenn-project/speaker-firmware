@@ -16,7 +16,8 @@ enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOf
                              Claim,    // the inaudible tone (below), at full level whatever the volume
                              TimerDone, Alarm,  // at least at a level you'd hear, whatever the volume
                              Notify,
-                             ToneTest };  // the tone test's sweep (below); queued by startToneTest()
+                             ToneTest,  // the tone test's sweep (below); queued by startToneTest()
+                             Warm };    // switches the amplifier on, silently (warmUp())
 
 // false if the codec doesn't answer. `ultrasonic`: run the codec at 48 kHz, for wake word arbitration (below);
 // otherwise at 16 kHz, and there are no claims.
@@ -92,6 +93,10 @@ constexpr uint32_t CLAIM_TONE_MS = 15;
 constexpr int claimHz(int level) { return CLAIM_BASE_HZ + level * CLAIM_STEP_HZ; }
 void claim(int level);  // plays our claim, at full level whatever the volume
 uint32_t claimMs();     // how long it takes
+// Switch the amplifier on now and keep it on for `ms`, so a claim played in that time comes out at once: switched
+// on from cold, the amplifier takes a while to make any sound (a 45 ms claim with 5 ms came out silent).
+constexpr uint32_t AMP_WAKE_MS = 100;
+void warmUp(uint32_t ms);
 struct HeardClaim {
   uint32_t at = 0;    // millis() when it was heard (when it ended); 0 if none yet
   int level = -1;     // 0 = the loudest

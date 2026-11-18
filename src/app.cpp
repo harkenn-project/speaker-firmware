@@ -1368,7 +1368,8 @@ void start_tone_test(bool play, const char* from) {
   strlcpy(tone_test_from, from, sizeof(tone_test_from));
   tone_test_started = millis() | 1;
   if (play) {
-    LOGI(TAG, "tone test: playing the sweep at full level");
+    LOGI(TAG, "tone test: playing the sweep at full level%s",
+         audio::micMuted() ? " (the microphone is muted, so this speaker won't measure it)" : "");
   } else {
     LOGI(TAG, "tone test: listening to %s", from);
   }
@@ -1377,6 +1378,10 @@ void start_tone_test(bool play, const char* from) {
 void log_tone_test() {
   audio::ToneTest r;
   if (!audio::toneTestResult(r)) return;
+  if (r.played && audio::micMuted()) {
+    tone_test_started = 0;
+    return;  // played, not measured
+  }
   const char* who = r.played ? "own sweep" : tone_test_from;
   for (int t = 0; t < audio::TEST_TONES; t++) {
     const bool got = r.back_ms[t] >= 0;
@@ -1457,7 +1462,9 @@ void arbitrate() {
        db, my_level, static_cast<unsigned>(ago), static_cast<unsigned>(wait));
   arbitration_started = millis();
   voice = Voice::Arbitrating;
-  voice_at = millis() + wait;
+  // Every speaker waits for its amplifier first, so the levels stay ARBITRATION_MS_PER_DB apart.
+  audio::warmUp(audio::AMP_WAKE_MS + wait + 1000);
+  voice_at = millis() + audio::AMP_WAKE_MS + wait;
 }
 
 // Another speaker heard the wake word better: stop whatever we started, quietly.
