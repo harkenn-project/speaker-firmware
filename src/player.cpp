@@ -472,7 +472,7 @@ void sleep_timer() {
     fade_started = millis() | 1;
     LOGI(TAG, "sleep timer: fading out");
   }
-  gain = max(0.0f, 1.0f - static_cast<float>(millis() - fade_started) / SLEEP_FADE_MS);
+  gain = max(0.0f, 1.0f - static_cast<float>(max<int32_t>(0, static_cast<int32_t>(millis() - fade_started))) / SLEEP_FADE_MS);
   if (left <= 0 && gain <= 0) stop_now();
 }
 

@@ -221,10 +221,13 @@ std::unique_ptr<FirmwareUpdate> offered_update;  // shown on screen as "Update a
 volatile bool offer_install = false, offer_dismiss = false;
 bool update_checked = false;  // asked Harkenn for updates since boot
 
-enum class Voice { Off, Arbitrating, Starting, Listening, Waiting, Speaking };
-bool wake_arbitration = true;      // config audio.wake_arbitration: only the nearest speaker answers (arbitrate())
-bool audio_restart_wanted = false;  // it changed: restart, so the codec runs at the rate it needs
-uint32_t arbitration_started = 0;
+enum class Voice { Off, Starting, Listening, Waiting, Speaking };
+// Wake word arbitration (config audio.wake_arbitration): when several speakers hear the wake word, Harkenn lets
+// the one that heard it loudest answer. Each answers at once and says how loud the word was in its voice_start;
+// the others get voice_stand_down and go quiet.
+bool wake_arbitration = true;
+bool wake_pending = false;  // the next voice_start is for a wake word: say how loud it was
+int wake_db = 0;            // how loud, in dBFS
 Voice voice = Voice::Off;
 uint32_t voice_at = 0;
 uint32_t voice_session = 0;
@@ -883,10 +886,6 @@ void apply_config(JsonDocument& doc) {
   ui::showSleepClock(false);  // the config wakes the screen (below)
   silence_ms = constrain(cfg["audio"]["silence_s"] | 5, 1, 30) * 1000;
   wake_arbitration = cfg["audio"]["wake_arbitration"] | true;
-  if (wake_arbitration != store::ultrasonic()) {  // the codec's rate is set at startup
-    store::setUltrasonic(wake_arbitration);
-    audio_restart_wanted = true;
-  }
   // The speaker's own volume (set on the touch screen) wins unless the volume in the config was changed.
   const int config_volume = constrain(cfg["audio"]["volume"] | 70, 0, 100);
   if (config_volume != store::configVolume()) {
@@ -1261,6 +1260,8 @@ void start_voice() {
   doc["rate"] = audio::SAMPLE_RATE;
   if (t > 1700000000) doc["local_time"] = now;
   if (follow_up_turn) doc["follow_up"] = true;
+  if (wake_pending) doc["wake"]["db"] = wake_db;
+  wake_pending = false;
   send_json(doc);
   voice = Voice::Listening;
   server_heard_speech = false;
@@ -1312,204 +1313,24 @@ void start_ringing(const String& id, uint32_t seconds) {
 }
 
 // A new conversation (tap, wake word) plays the wake sound; listening for a reply after speaking plays a soft cue.
-// `queued_ms`: sound already queued before the cue (the claim tone), so listening starts after both.
-void start_listening_turn(bool after_speech = false, bool follow_up = false, uint32_t queued_ms = 0) {
+void start_listening_turn(bool after_speech = false, bool follow_up = false) {
+  wake_pending = false;  // wake_word_heard() sets it after this
   const audio::Sound cue = after_speech ? audio::Sound::Listen : audio::Sound::Activate;
   audio::play(cue);
   follow_up_turn = follow_up;
   ui::setState("listening");
   voice = Voice::Starting;
   // start listening once the cue has played (a voiced wake sound is longer than a chime), so it isn't sent
-  voice_at = millis() + queued_ms + max(CHIME_MS, audio::soundMs(cue) + 120);
+  voice_at = millis() + max(CHIME_MS, audio::soundMs(cue) + 120);
 }
 
-// Wake word arbitration: when several speakers hear the wake word, only the one that heard it loudest answers.
-// Each waits ARBITRATION_MS_PER_DB for every dB it heard the word below ARBITRATION_LOUD_DB, then plays its claim
-// (three quick tones above hearing; the last one's pitch carries its level, 3 dB a level; audio.h) and answers. So
-// the loudest claims first, and the others hear it before their own turn comes. Strongest wins:
-// - before claiming, a speaker that hears a claim as strong as its own, or stronger, stays quiet;
-// - one that hears a weaker claim (that speaker caught the word sooner) claims at once;
-// - after claiming, a speaker that hears a stronger claim within CHALLENGE_MS stops answering and goes back to idle.
-// A speaker can't hear claims while it plays its own (and CLAIM_ECHO_MS after), so the spacing must outlast the
-// trip from one speaker's claim to the other's decision: up to ~60 ms of output buffering, the 45 ms claim, and
-// ~25 ms of input. At 50 ms a dB, speakers 3 dB apart are 150 ms apart (in simulation one answers ~90% of the time,
-// always from 4 dB). Closer than that, both may still answer. The "came back after N ms" log line measures the real
-// output delay, for tuning this.
-constexpr int ARBITRATION_LOUD_DB = -10;  // heard this loud or louder: no wait, level 0
-constexpr int ARBITRATION_DB_PER_LEVEL = 3;
-constexpr uint32_t ARBITRATION_MS_PER_DB = 50;
-constexpr uint32_t ARBITRATION_JITTER_MS = 10;
-constexpr uint32_t CLAIM_LOOKBACK_MS = 1500;  // a claim heard this long before we caught the word still counts
-constexpr uint32_t CHALLENGE_MS = 1500;       // after our claim, a stronger one still takes over
-constexpr uint32_t TONE_PROBE_MS = 1000;      // after a wake word, log the loudest the claim band got
-int my_level = 0;
-uint32_t claimed_at = 0;  // when we claimed; 0 = no claim of ours in play
-uint32_t tone_probe_until = 0;
-
-int db_below_loud(int db) {
-  return constrain(ARBITRATION_LOUD_DB - db, 0, ARBITRATION_DB_PER_LEVEL * audio::CLAIM_LEVELS - 1);
-}
-
-int level_for(int db) { return db_below_loud(db) / ARBITRATION_DB_PER_LEVEL; }
-
-float khz(int hz) { return hz / 1000.0f; }
-
-// The tone test (Harkenn's "Test tones between speakers"; audio.h): we play the sweep, or listen to `from` play it.
-char tone_test_from[41] = "";
-uint32_t tone_test_started = 0;
-
-void start_tone_test(bool play, const char* from) {
-  if (!audio::startToneTest(play)) {
-    LOGI(TAG, "tone test: can't run it here (%s)", !audio::ultrasonic() ? "the codec runs at 16 kHz"
-                                                   : audio::micMuted() ? "the microphone is muted"
-                                                                       : "a test is already running");
-    return;
-  }
-  strlcpy(tone_test_from, from, sizeof(tone_test_from));
-  tone_test_started = millis() | 1;
-  if (play) {
-    LOGI(TAG, "tone test: playing the sweep at full level%s",
-         audio::micMuted() ? " (the microphone is muted, so this speaker won't measure it)" : "");
-  } else {
-    LOGI(TAG, "tone test: listening to %s", from);
-  }
-}
-
-void log_tone_test() {
-  audio::ToneTest r;
-  if (!audio::toneTestResult(r)) return;
-  if (r.played && audio::micMuted()) {
-    tone_test_started = 0;
-    return;  // played, not measured
-  }
-  const char* who = r.played ? "own sweep" : tone_test_from;
-  for (int t = 0; t < audio::TEST_TONES; t++) {
-    const bool got = r.back_ms[t] >= 0;
-    if (r.played && got) {
-      LOGI(TAG, "tone test (%s): %.1f kHz HEARD, %d (quiet %d), %d ms after it was written", who,
-           khz(audio::TEST_HZ[t]), r.heard[t], r.quiet[t], r.back_ms[t]);
-    } else {
-      LOGI(TAG, "tone test (%s): %.1f kHz %s, %d (quiet %d)", who, khz(audio::TEST_HZ[t]),
-           got ? "HEARD" : "not heard", r.heard[t], r.quiet[t]);
-    }
-  }
-  if (!r.played) {
-    const audio::HeardClaim h = audio::lastClaim();
-    if (h.at && static_cast<int32_t>(h.at - tone_test_started) >= 0) {
-      LOGI(TAG, "tone test (%s): its claim was decoded, level %d, weakest tone %d", who, h.level, h.strength);
-    } else {
-      LOGI(TAG, "tone test (%s): its claim was NOT decoded", who);
-    }
-  }
-  tone_test_started = 0;
-}
-
-// What the claim detector heard (audio.h), so the logs show whether tones reach this speaker at all.
-void log_tones() {
-  audio::ToneEvent e;
-  while (audio::takeToneEvent(e)) {
-    switch (e.kind) {
-      case audio::ToneEvent::Claim:
-        LOGI(TAG, "tone: claim, level %d (%.1f kHz), %d ms, weakest tone amplitude %d, noise %d", e.level, khz(e.hz),
-             e.ms, e.amplitude, e.noise);
-        break;
-      case audio::ToneEvent::Fragment:
-        LOGI(TAG, "tone: %.1f kHz for %d ms, amplitude %d, noise %d (not part of a claim)", khz(e.hz), e.ms,
-             e.amplitude, e.noise);
-        break;
-      case audio::ToneEvent::Own:
-        if (e.ms >= 0) {
-          LOGI(TAG, "tone: our own claim came back after %d ms at amplitude %d at %.1f kHz, noise %d", e.ms,
-               e.amplitude, khz(e.hz), e.noise);
-        } else {
-          LOGI(TAG, "tone: our own claim didn't come back (loudest %d at %.1f kHz, noise %d): is the tone playing, "
-                    "does the mic hear it?", e.amplitude, khz(e.hz), e.noise);
-        }
-        break;
-    }
-  }
-  if (const int dropped = audio::droppedToneEvents()) LOGI(TAG, "tone: %d more not logged", dropped);
-  log_tone_test();
-  if (tone_probe_until && static_cast<int32_t>(millis() - tone_probe_until) >= 0) {
-    tone_probe_until = 0;
-    const audio::ClaimBand b = audio::claimBandPeak(0);
-    LOGI(TAG, "tone: loudest in the claim band in the %u ms after the wake word: amplitude %d at %.1f kHz, noise %d "
-              "(a claim needs over 30 and 4x the noise)",
-         static_cast<unsigned>(TONE_PROBE_MS), b.amplitude, khz(b.hz), b.noise);
-  }
-}
-
-void arbitrate() {
+void wake_word_heard() {
   uint32_t ago = 0;
-  const int db = audio::recentLevelDb(&ago);
-  my_level = level_for(db);
-  claimed_at = 0;
-  audio::claimBandPeak(0);  // start the probe afresh
-  tone_probe_until = millis() + TONE_PROBE_MS;
-  uint32_t wait = db_below_loud(db) * ARBITRATION_MS_PER_DB + esp_random() % ARBITRATION_JITTER_MS;
-  const audio::HeardClaim heard = audio::lastClaim();
-  if (heard.at && millis() - heard.at < CLAIM_LOOKBACK_MS) {
-    if (heard.level <= my_level) {
-      LOGI(TAG, "wake word at %d dBFS (level %d, loudest %u ms before detection): another speaker claimed at level %d "
-                "%u ms ago and is answering; staying quiet",
-           db, my_level, static_cast<unsigned>(ago), heard.level, static_cast<unsigned>(millis() - heard.at));
-      return;
-    }
-    wait = 0;  // we heard it better than the speaker answering: take over
-  }
-  LOGI(TAG, "wake word at %d dBFS (level %d, loudest %u ms before detection): answering in %u ms unless a closer "
-            "speaker does",
-       db, my_level, static_cast<unsigned>(ago), static_cast<unsigned>(wait));
-  arbitration_started = millis();
-  voice = Voice::Arbitrating;
-  // Every speaker waits for its amplifier first, so the levels stay ARBITRATION_MS_PER_DB apart.
-  audio::warmUp(audio::AMP_WAKE_MS + wait + 1000);
-  voice_at = millis() + audio::AMP_WAKE_MS + wait;
-}
-
-// Another speaker heard the wake word better: stop whatever we started, quietly.
-void stand_down(const audio::HeardClaim& other) {
-  LOGI(TAG, "wake word: another speaker heard it better (level %d, ours %d, its signal %d here); standing down",
-       other.level, my_level, other.strength);
-  if (voice == Voice::Listening) {
-    audio::stopListening();
-    send_voice("voice_cancel");
-  } else if (voice == Voice::Waiting) {
-    send_voice("voice_cancel");
-  } else if (voice == Voice::Speaking) {
-    audio::stopSpeech();
-    send_voice("speak_stop");
-  }
-  claimed_at = 0;
-  listen_after_speech = false;
-  voice_done();
-}
-
-void update_arbitration() {
-  log_tones();
-  const audio::HeardClaim heard = audio::lastClaim();
-  if (voice == Voice::Arbitrating) {
-    if (heard.at && static_cast<int32_t>(heard.at - arbitration_started) >= 0) {
-      if (heard.level <= my_level) {  // as strong or stronger, and first
-        stand_down(heard);
-        return;
-      }
-      voice_at = millis();  // weaker: claim now, so it stands down
-    }
-    if (static_cast<int32_t>(millis() - voice_at) >= 0) {
-      audio::claim(my_level);  // tell the others, then answer
-      claimed_at = millis() | 1;
-      board::markActivity();
-      LOGI(TAG, "wake word: claiming at level %d (%.1f kHz)", my_level, khz(audio::claimHz(my_level)));
-      start_listening_turn(false, false, audio::claimMs());
-    }
-  } else if (claimed_at) {
-    if (voice == Voice::Off || millis() - claimed_at > CHALLENGE_MS) {
-      claimed_at = 0;
-    } else if (heard.at && static_cast<int32_t>(heard.at - claimed_at) > 0 && heard.level < my_level) {
-      stand_down(heard);  // a stronger claim after ours
-    }
-  }
+  wake_db = audio::recentLevelDb(&ago);
+  LOGI(TAG, "wake word at %d dBFS (loudest %u ms before detection)", wake_db, static_cast<unsigned>(ago));
+  board::markActivity();  // wake the screen
+  start_listening_turn();
+  wake_pending = wake_arbitration;
 }
 
 void handle_tap() {
@@ -1581,6 +1402,11 @@ void handle_voice_message(const String& type, JsonDocument& doc) {
   } else if (type == "listen_stop" && voice == Voice::Listening) {  // Harkenn heard speech, then silence
     server_heard_speech = true;
     audio::stopListening();  // pump_mic() ends the utterance
+  } else if (type == "voice_stand_down") {  // another speaker heard the wake word louder: it answers
+    LOGI(TAG, "wake word: %s heard it louder (%d dBFS); going quiet", doc["winner"] | "another speaker",
+         doc["winner_db"] | 0);
+    if (voice == Voice::Listening) audio::stopListening();
+    if (voice == Voice::Listening || voice == Voice::Waiting) voice_done();
   } else if (type == "voice_result") {
     const String heard = doc["heard"] | "";
     const String reply = doc["reply"] | "";
@@ -1907,28 +1733,15 @@ void update_voice() {
   if (woke && timer_ringing()) {
     stop_timer_ring("timer_stopped", "the wake word", false);  // instead of starting a conversation
   } else if (woke && ws_connected) {
-    if (wake_arbitration && audio::ultrasonic()) {
-      arbitrate();
-    } else {
-      board::markActivity();  // wake the screen
-      start_listening_turn();
-    }
+    wake_word_heard();
   }
-  update_arbitration();
   static uint32_t last_stats = 0;
   if (wakeword::loaded() && millis() - last_stats > 60000) {
     last_stats = millis();
     const wakeword::Stats st = wakeword::stats();
     const audio::MicStats mic = audio::micStats();
-    if (audio::ultrasonic()) {
-      const audio::ClaimBand band = audio::claimBandPeak(1);
-      LOGI(TAG, "mic (48 kHz): average %d dBFS, loudest %d dBFS, noise floor %d; claim band loudest %d at %.1f kHz, "
-                "noise %d",
-           mic.average_db, mic.loudest_db, mic.noise_floor, band.amplitude, khz(band.hz), band.noise);
-    } else {
-      LOGI(TAG, "mic (16 kHz): average %d dBFS, loudest %d dBFS, noise floor %d", mic.average_db, mic.loudest_db,
-           mic.noise_floor);
-    }
+    LOGI(TAG, "mic: average %d dBFS, loudest %d dBFS, noise floor %d", mic.average_db, mic.loudest_db,
+         mic.noise_floor);
     LOGI(TAG, "wake word: %u inferences in the last minute, %u us each, highest %u%%", st.inferences,
          st.avg_infer_us, static_cast<unsigned>(st.max_probability * 100));
   }
@@ -2086,9 +1899,6 @@ void handle_text(const uint8_t* payload, size_t len) {
       card_format_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
-    } else if (command == "tone_test") {
-      const String role = args["role"] | "listen";
-      start_tone_test(role == "play", args["from"] | "another speaker");
     } else if (command == "refresh_config") {
       want_config = true;
     } else if (command == "update_firmware") {
@@ -2363,12 +2173,6 @@ bool run_online(bool use_relay = false) {
       ws.disconnect();
       return true;  // starts over with the new server address
     }
-    if (audio_restart_wanted && voice == Voice::Off) {
-      LOGI(TAG, "only the nearest answers: %s; restarting so the audio runs at %s kHz", wake_arbitration ? "on" : "off",
-           wake_arbitration ? "48" : "16");
-      flush_logs();
-      restart();
-    }
     if (factory_reset_wanted) {
       LOGW(TAG, "factory reset requested by Harkenn");
       flush_logs();
@@ -2581,7 +2385,7 @@ void main_task(void*) {
   wakeword::begin();
   timers::begin();
   ui::onNotificationTap([] { note_reopen = true; });
-  if (audio::begin(store::ultrasonic())) {
+  if (audio::begin()) {
     audio::setVolume(volume);
     audio::setMicMuted(store::micMuted());
   }
