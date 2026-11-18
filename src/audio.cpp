@@ -216,6 +216,7 @@ const Note* notes_for(Sound s) {
     case Sound::TimerDone: return TIMER_DONE;
     case Sound::Alarm: return ALARM;
     case Sound::Notify: return NOTIFY;
+    case Sound::ToneTest: return TICK;  // played by render_tone_test()
   }
   return TICK;
 }
@@ -264,6 +265,93 @@ void render_claim(int level) {
     write_raw(buf, m);
   }
   claiming_until = millis() + CLAIM_ECHO_MS;
+}
+
+// The tone test (audio.h). test_t0: millis() when it started, 0 when none is running; the capture task measures
+// (measure_tone_test) and sets test_done at the end.
+volatile uint32_t test_t0 = 0;
+volatile bool test_done = false;
+ToneTest test;
+
+// The sweep, on the test's schedule: silence until each tone's slot (the writes wait for the DMA buffers, so the
+// schedule holds give or take what's buffered), then the tone, then a claim at level 0.
+void render_tone_test(uint32_t t0) {
+  static int16_t buf[CHUNK * RATIO];
+  const uint32_t tone = HW_RATE * TEST_TONE_MS / 1000, ramp = HW_RATE * 5 / 1000;
+  auto silence_until = [&](uint32_t at) {
+    memset(buf, 0, sizeof(buf));
+    while (test_t0 == t0 && millis() - t0 < at) write_raw(buf, CHUNK * RATIO);
+  };
+  wr(0x32, 0xBF);  // DAC at 0 dB
+  for (int t = 0; t < TEST_TONES && test_t0 == t0; t++) {
+    silence_until(TEST_LEAD_MS + t * TEST_STEP_MS);
+    const float w = 2.0f * PI * TEST_HZ[t] / HW_RATE;
+    for (uint32_t i = 0; i < tone;) {
+      const size_t m = min<uint32_t>(CHUNK * RATIO, tone - i);
+      for (size_t k = 0; k < m; k++, i++) {
+        const uint32_t edge = min(i, tone - 1 - i);
+        const float env = edge >= ramp ? 1.0f : 0.5f - 0.5f * cosf(PI * edge / ramp);
+        buf[k] = static_cast<int16_t>(23000.0f * env * sinf(w * i));
+      }
+      write_raw(buf, m);
+    }
+  }
+  silence_until(TEST_CLAIM_AT_MS);
+  if (test_t0 == t0) render_claim(0);
+}
+
+// The capture side: each test pitch through a Hann window (so a loud tone doesn't leak into the next pitch's
+// measurement), in 5 ms blocks, on the test's schedule.
+void measure_tone_test(const int16_t* raw, size_t n) {
+  constexpr int BLOCK = HW_RATE * 5 / 1000;
+  struct Filter {
+    float coeff = 0, s1 = 0, s2 = 0;
+  };
+  static Filter f[TEST_TONES];
+  static float win[BLOCK];
+  static bool ready = false;
+  static uint32_t seen_t0 = 0;
+  static int count = 0;
+  if (!ready) {
+    for (int t = 0; t < TEST_TONES; t++) f[t].coeff = 2.0f * cosf(2.0f * PI * TEST_HZ[t] / HW_RATE);
+    for (int i = 0; i < BLOCK; i++) win[i] = 0.5f - 0.5f * cosf(2.0f * PI * i / (BLOCK - 1));
+    ready = true;
+  }
+  const uint32_t t0 = test_t0;
+  if (!t0 || test_done) return;
+  if (t0 != seen_t0) {  // a new test: start the blocks afresh
+    seen_t0 = t0;
+    count = 0;
+    for (Filter& g : f) g.s1 = g.s2 = 0;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const float x = raw[i] * win[count];
+    for (Filter& g : f) {
+      const float s0 = x + g.coeff * g.s1 - g.s2;
+      g.s2 = g.s1;
+      g.s1 = s0;
+    }
+    if (++count < BLOCK) continue;
+    count = 0;
+    const int32_t at = static_cast<int32_t>(millis() - t0);
+    for (int t = 0; t < TEST_TONES; t++) {
+      Filter& g = f[t];
+      const float power = g.s1 * g.s1 + g.s2 * g.s2 - g.coeff * g.s1 * g.s2;
+      g.s1 = g.s2 = 0;
+      const int amp = static_cast<int>(4.0f * sqrtf(max(power, 0.0f)) / BLOCK);  // x2 for the Hann window's loss
+      const int32_t slot = TEST_LEAD_MS + t * TEST_STEP_MS;
+      if (at < static_cast<int32_t>(TEST_LEAD_MS) - 50) {
+        test.quiet[t] = max(test.quiet[t], amp);
+      } else if (at >= slot - 30 && at < slot + static_cast<int32_t>(TEST_TONE_MS) + 120) {
+        test.heard[t] = max(test.heard[t], amp);
+        if (test.back_ms[t] < 0 && amp > 30 && amp > 4 * test.quiet[t]) test.back_ms[t] = at - slot;
+      }
+    }
+    if (at >= static_cast<int32_t>(TEST_MS)) {
+      test_done = true;
+      return;
+    }
+  }
 }
 
 void render(const Note* notes) {
@@ -373,10 +461,14 @@ void play_task(void*) {
     Sound s;
     const bool music_due = music && xStreamBufferBytesAvailable(music) && (!music_holds || music_level > 0);
     if (xQueueReceive(queue, &s, speech_on || music_due ? 0 : pdMS_TO_TICKS(music ? 10 : AMP_OFF_AFTER_MS)) == pdTRUE) {
-      if (s == Sound::Claim) {  // inaudible: played whatever the volume
+      if (s == Sound::Claim || s == Sound::ToneTest) {  // played whatever the volume
         sound_playing = true;
         amp(true);
-        render_claim(claim_level);
+        if (s == Sound::Claim) {
+          render_claim(claim_level);
+        } else if (const uint32_t t0 = test_t0) {
+          render_tone_test(t0);
+        }
         apply_volume();
         sound_playing = false;
         continue;
@@ -677,7 +769,10 @@ void capture_task(void*) {
       continue;
     }
     const size_t n_raw = got_raw / sizeof(int16_t) / ratio * ratio;
-    if (!mic_muted && ratio == RATIO) listen_for_claims(raw, n_raw);
+    if (!mic_muted && ratio == RATIO) {
+      listen_for_claims(raw, n_raw);
+      measure_tone_test(raw, n_raw);
+    }
     decimate(raw, n_raw, buf);
     const size_t n = n_raw / ratio;
     const size_t got = n * sizeof(int16_t);
@@ -925,6 +1020,32 @@ void claim(int level) {
 }
 
 uint32_t claimMs() { return 3 * CLAIM_TONE_MS; }
+
+bool startToneTest(bool play) {
+  if (!ok || ratio != RATIO || mic_muted || test_t0) return false;
+  test = ToneTest();
+  test.played = play;
+  for (int& b : test.back_ms) b = -1;
+  test_done = false;
+  test_t0 = millis() | 1;  // last: the capture task starts measuring
+  if (play) {
+    const Sound s = Sound::ToneTest;
+    xQueueSend(queue, &s, 0);
+  }
+  return true;
+}
+
+bool toneTestResult(ToneTest& r) {
+  if (!test_t0) return false;
+  if (!test_done) {
+    if (millis() - test_t0 < TEST_MS + 2000) return false;
+    // the capture task stopped measuring (the mic was muted midway): report what there is
+  }
+  r = test;
+  test_t0 = 0;
+  test_done = false;
+  return true;
+}
 
 bool takeToneEvent(ToneEvent& e) {
   portENTER_CRITICAL(&heard_lock);

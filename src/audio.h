@@ -15,7 +15,8 @@ enum class Sound : uint8_t { Boot, Activate, Done, Cancel, Error, MuteOn, MuteOf
                              Listen,   // a soft cue when it listens for a reply
                              Claim,    // the inaudible tone (below), at full level whatever the volume
                              TimerDone, Alarm,  // at least at a level you'd hear, whatever the volume
-                             Notify };
+                             Notify,
+                             ToneTest };  // the tone test's sweep (below); queued by startToneTest()
 
 // false if the codec doesn't answer. `ultrasonic`: run the codec at 48 kHz, for wake word arbitration (below);
 // otherwise at 16 kHz, and there are no claims.
@@ -119,6 +120,25 @@ struct ClaimBand {
   int amplitude = 0, hz = 0, noise = 0;
 };
 ClaimBand claimBandPeak(int reader);
+
+// Tone test (Harkenn's "Test tones between speakers"): one speaker plays a 150 ms tone at each of TEST_HZ, 250 ms
+// apart after 300 ms of quiet, then a claim at level 0; the others only listen. Every speaker measures each pitch in
+// its own window of that schedule (so a harmonic of one tone doesn't count for another), against the same pitch in
+// the quiet before. The schedule runs from when the command arrived, so speakers needn't be exactly in step.
+constexpr int TEST_TONES = 8;
+constexpr int TEST_HZ[TEST_TONES] = {8000, 12000, 15000, 16000, 17000, 18000, 19000, 20000};
+constexpr uint32_t TEST_LEAD_MS = 300, TEST_TONE_MS = 150, TEST_STEP_MS = 250;
+constexpr uint32_t TEST_CLAIM_AT_MS = TEST_LEAD_MS + TEST_TONES * TEST_STEP_MS + 100;
+constexpr uint32_t TEST_MS = TEST_CLAIM_AT_MS + 700;  // the claim, and time for it to arrive and be read
+struct ToneTest {
+  bool played = false;           // we played the sweep (false: we listened)
+  int heard[TEST_TONES] = {};    // the loudest 5 ms block of each pitch in its window (out of 32767)
+  int quiet[TEST_TONES] = {};    // the loudest block of each pitch in the quiet before
+  int back_ms[TEST_TONES] = {};  // from the start of its slot to the first block well above quiet; -1 if none
+};
+// false if it can't: the codec runs at 16 kHz (no high tones), the mic is muted, or a test is running.
+bool startToneTest(bool play);
+bool toneTestResult(ToneTest& r);  // true once, when the test has finished
 
 // The loudest 16 ms of the last 1.5 s, in dB below full scale: how loud the wake word was, just after it's heard.
 // `ago_ms`, if given, gets how long ago that was.

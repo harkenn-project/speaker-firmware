@@ -1354,6 +1354,51 @@ int level_for(int db) { return db_below_loud(db) / ARBITRATION_DB_PER_LEVEL; }
 
 float khz(int hz) { return hz / 1000.0f; }
 
+// The tone test (Harkenn's "Test tones between speakers"; audio.h): we play the sweep, or listen to `from` play it.
+char tone_test_from[41] = "";
+uint32_t tone_test_started = 0;
+
+void start_tone_test(bool play, const char* from) {
+  if (!audio::startToneTest(play)) {
+    LOGI(TAG, "tone test: can't run it here (%s)", !audio::ultrasonic() ? "the codec runs at 16 kHz"
+                                                   : audio::micMuted() ? "the microphone is muted"
+                                                                       : "a test is already running");
+    return;
+  }
+  strlcpy(tone_test_from, from, sizeof(tone_test_from));
+  tone_test_started = millis() | 1;
+  if (play) {
+    LOGI(TAG, "tone test: playing the sweep at full level");
+  } else {
+    LOGI(TAG, "tone test: listening to %s", from);
+  }
+}
+
+void log_tone_test() {
+  audio::ToneTest r;
+  if (!audio::toneTestResult(r)) return;
+  const char* who = r.played ? "own sweep" : tone_test_from;
+  for (int t = 0; t < audio::TEST_TONES; t++) {
+    const bool got = r.back_ms[t] >= 0;
+    if (r.played && got) {
+      LOGI(TAG, "tone test (%s): %.1f kHz HEARD, %d (quiet %d), %d ms after it was written", who,
+           khz(audio::TEST_HZ[t]), r.heard[t], r.quiet[t], r.back_ms[t]);
+    } else {
+      LOGI(TAG, "tone test (%s): %.1f kHz %s, %d (quiet %d)", who, khz(audio::TEST_HZ[t]),
+           got ? "HEARD" : "not heard", r.heard[t], r.quiet[t]);
+    }
+  }
+  if (!r.played) {
+    const audio::HeardClaim h = audio::lastClaim();
+    if (h.at && static_cast<int32_t>(h.at - tone_test_started) >= 0) {
+      LOGI(TAG, "tone test (%s): its claim was decoded, level %d, weakest tone %d", who, h.level, h.strength);
+    } else {
+      LOGI(TAG, "tone test (%s): its claim was NOT decoded", who);
+    }
+  }
+  tone_test_started = 0;
+}
+
 // What the claim detector heard (audio.h), so the logs show whether tones reach this speaker at all.
 void log_tones() {
   audio::ToneEvent e;
@@ -1379,6 +1424,7 @@ void log_tones() {
     }
   }
   if (const int dropped = audio::droppedToneEvents()) LOGI(TAG, "tone: %d more not logged", dropped);
+  log_tone_test();
   if (tone_probe_until && static_cast<int32_t>(millis() - tone_probe_until) >= 0) {
     tone_probe_until = 0;
     const audio::ClaimBand b = audio::claimBandPeak(0);
@@ -2033,6 +2079,9 @@ void handle_text(const uint8_t* payload, size_t len) {
       card_format_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
+    } else if (command == "tone_test") {
+      const String role = args["role"] | "listen";
+      start_tone_test(role == "play", args["from"] | "another speaker");
     } else if (command == "refresh_config") {
       want_config = true;
     } else if (command == "update_firmware") {
