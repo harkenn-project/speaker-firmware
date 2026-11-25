@@ -272,6 +272,7 @@ volatile bool update_check_wanted = false;
 volatile bool factory_reset_wanted = false;  // Harkenn asked
 volatile bool card_rescan_wanted = false;  // Harkenn asked
 volatile bool card_format_wanted = false;  // Harkenn asked (admin only: it erases the card)
+volatile bool wake_test_wanted = false;   // Harkenn asked: test the wake word (update_voice)
 uint32_t card_sent = UINT32_MAX;  // the card::version() Harkenn last heard about
 uint32_t media_sent = UINT32_MAX;  // the player::version() Harkenn last heard about
 char device_name[49] = "";
@@ -1722,18 +1723,24 @@ void update_timers() {
 
 // Wake clips (config wake_word.clips): what the wake word heard up to its last detection, sent once the speaker is
 // idle again so the conversation isn't held up. Harkenn keeps them, so false wakes can be found and trained away.
+// A wake word test (command wake_test) sends its clip the same way, as wake_test with whether it would have woken.
 void send_wake_clip() {
   static int16_t* pcm = nullptr;  // PSRAM, on first use
-  if (!pcm) pcm = static_cast<int16_t*>(heap_caps_malloc(wakeword::CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (!pcm) pcm = static_cast<int16_t*>(heap_caps_malloc(wakeword::TEST_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
   if (!pcm) return;
-  float probability = 0;
-  const size_t n = wakeword::takeClip(pcm, &probability);
+  const wakeword::Clip clip = wakeword::takeClip(pcm);
+  const size_t n = clip.samples;
+  const float probability = clip.probability;
   if (!n) return;
   JsonDocument doc;
-  doc["type"] = "wake_clip";
+  doc["type"] = clip.test ? "wake_test" : "wake_clip";
   doc["rate"] = audio::SAMPLE_RATE;
   doc["bytes"] = n * sizeof(int16_t);
   doc["probability"] = roundf(probability * 1000) / 1000;
+  if (clip.test) {
+    doc["detected"] = clip.detected;
+    audio::play(clip.detected ? audio::Sound::Done : audio::Sound::Cancel);  // the result, heard from afar
+  }
   send_json(doc);
   // its audio straight after, nothing in between (Harkenn drops a clip that another message interrupts)
   const uint8_t* p = reinterpret_cast<const uint8_t*>(pcm);
@@ -1744,8 +1751,54 @@ void send_wake_clip() {
       return;
     }
   }
-  LOGI(TAG, "wake clip sent: %u ms, probability %u%%", static_cast<unsigned>(n / 16),
-       static_cast<unsigned>(probability * 100));
+  LOGI(TAG, "%s sent: %u ms, probability %u%%", clip.test ? "wake word test" : "wake clip",
+       static_cast<unsigned>(n / 16), static_cast<unsigned>(probability * 100));
+}
+
+void send_wake_test_error(const char* error) {
+  JsonDocument doc;
+  doc["type"] = "wake_test";
+  doc["error"] = error;
+  send_json(doc);
+  LOGW(TAG, "wake word test: %s", error);
+}
+
+// Wake word test (command wake_test): a cue, then the wake word listens for a few seconds without waking anything,
+// then a sound says whether it heard it and the clip goes to Harkenn (send_wake_clip).
+enum class WakeTest : uint8_t { Off, Cue, Running };
+WakeTest wake_test = WakeTest::Off;
+uint32_t wake_test_at = 0;
+
+void update_wake_test(bool idle) {
+  if (wake_test_wanted) {
+    wake_test_wanted = false;
+    if (!wakeword::loaded()) send_wake_test_error("no wake word model");
+    else if (audio::micMuted()) send_wake_test_error("the microphone is muted");
+    else if (!idle || wake_test != WakeTest::Off) send_wake_test_error("busy");
+    else {
+      audio::play(audio::Sound::Listen);
+      wake_test = WakeTest::Cue;
+      wake_test_at = millis() + audio::soundMs(audio::Sound::Listen) + 150;
+    }
+  }
+  if (wake_test == WakeTest::Cue && static_cast<int32_t>(millis() - wake_test_at) >= 0 && idle) {
+    if (wakeword::startTest()) {
+      wake_test = WakeTest::Running;
+      wake_test_at = millis();
+    } else {
+      wake_test = WakeTest::Off;
+      send_wake_test_error("no memory");
+    }
+  } else if (wake_test == WakeTest::Cue && millis() - wake_test_at > 10000) {
+    wake_test = WakeTest::Off;
+    send_wake_test_error("busy");
+  } else if (wake_test == WakeTest::Running && !wakeword::testing()) {
+    wake_test = WakeTest::Off;  // its clip goes with send_wake_clip
+  } else if (wake_test == WakeTest::Running && millis() - wake_test_at > wakeword::TEST_MS + 4000) {
+    wakeword::cancelTest();  // it stopped hearing (the speaker got busy)
+    wake_test = WakeTest::Off;
+    send_wake_test_error("interrupted");
+  }
 }
 
 void update_voice() {
@@ -1758,7 +1811,8 @@ void update_voice() {
   const bool idle = voice == Voice::Off && !ring_id.length() && !audio::micMuted() && !audio::speaking() &&
                     !audio::playing();
   wakeword::setListening(idle);
-  const bool woke = wakeword::takeDetection() && idle;
+  update_wake_test(idle);
+  const bool woke = wakeword::takeDetection() && idle && wake_test == WakeTest::Off;  // a test only listens
   if (woke && timer_ringing()) {
     stop_timer_ring("timer_stopped", "the wake word", false);  // instead of starting a conversation
   } else if (woke && ws_connected) {
@@ -1929,6 +1983,8 @@ void handle_text(const uint8_t* payload, size_t len) {
       card_format_wanted = true;  // from the main loop
     } else if (command == "identify") {
       ui::identify();
+    } else if (command == "wake_test") {
+      wake_test_wanted = true;  // from the main loop
     } else if (command == "refresh_config") {
       want_config = true;
     } else if (command == "update_firmware") {

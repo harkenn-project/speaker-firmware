@@ -93,29 +93,72 @@ volatile bool detected = false, stop_detected = false;
 Stats stats_now;
 uint64_t infer_us_total = 0;
 
-// Wake clips (setClips): what the wake word heard lately, in a ring, and a copy of it at the last detection. Guarded
-// by `lock`; PSRAM, allocated only while on.
+// Wake clips (setClips) and tests (startTest): what the wake word heard lately, in a ring, and a copy of it at the
+// last detection or test. Guarded by `lock`; PSRAM, allocated only while clips are on or a test needs them.
+constexpr size_t RING_SAMPLES = TEST_SAMPLES;
 int16_t* ring = nullptr;
 size_t ring_at = 0, ring_filled = 0;
 int16_t* clip = nullptr;
 volatile size_t clip_len = 0;  // read without the lock by takeClip(), to skip it cheaply when there's nothing
-float clip_probability = 0;
+Clip clip_info;
+bool clips_wanted = false;  // setClips(true): keep the buffers after a test
+
+// A test (startTest), armed by the task at the first audio after it starts, so it times what it actually hears.
+volatile bool test_on = false;
+bool test_armed = false;
+uint32_t test_from = 0, test_end = 0;  // scores count from test_from (after the model's warm-up)
+float test_peak = 0;
 
 void ring_add(const int16_t* s, size_t n) {
   if (!ring) return;
   for (size_t i = 0; i < n; i++) {
     ring[ring_at] = s[i];
-    ring_at = (ring_at + 1) % CLIP_SAMPLES;
+    ring_at = (ring_at + 1) % RING_SAMPLES;
   }
-  ring_filled = min(ring_filled + n, CLIP_SAMPLES);
+  ring_filled = min(ring_filled + n, RING_SAMPLES);
 }
 
-void snapshot_clip(float probability) {
+// The newest `max` samples of the ring into the clip.
+void snapshot(size_t max, const Clip& info) {
   if (!ring || !clip) return;
-  const size_t start = (ring_at + CLIP_SAMPLES - ring_filled) % CLIP_SAMPLES;
-  for (size_t i = 0; i < ring_filled; i++) clip[i] = ring[(start + i) % CLIP_SAMPLES];
-  clip_len = ring_filled;
-  clip_probability = probability;
+  const size_t n = min(ring_filled, max);
+  const size_t start = (ring_at + RING_SAMPLES - n) % RING_SAMPLES;
+  for (size_t i = 0; i < n; i++) clip[i] = ring[(start + i) % RING_SAMPLES];
+  clip_info = info;
+  clip_info.samples = n;
+  clip_len = n;
+}
+
+void free_buffers() {  // with the lock held (released while freeing, held again on return)
+  int16_t* r = ring;
+  int16_t* c = clip;
+  ring = clip = nullptr;
+  ring_at = ring_filled = clip_len = 0;
+  xSemaphoreGive(lock);
+  heap_caps_free(r);
+  heap_caps_free(c);
+  xSemaphoreTake(lock, portMAX_DELAY);
+}
+
+bool alloc_buffers() {  // without the lock; true if they're there
+  if (ring) return true;
+  auto* r = static_cast<int16_t*>(heap_caps_malloc(RING_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  auto* c = static_cast<int16_t*>(heap_caps_malloc(RING_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (!r || !c) {
+    heap_caps_free(r);
+    heap_caps_free(c);
+    return false;
+  }
+  xSemaphoreTake(lock, portMAX_DELAY);
+  if (!ring) {
+    std::swap(ring, r);
+    std::swap(clip, c);
+    ring_at = ring_filled = clip_len = 0;
+  }
+  xSemaphoreGive(lock);
+  heap_caps_free(r);  // only if another call got there first
+  heap_caps_free(c);
+  return true;
 }
 
 void free_model(Model* m) {
@@ -167,9 +210,18 @@ bool step(Model& m, const int8_t* features, bool count_stats) {
   m.recent_at = (m.recent_at + 1) % m.window;
   uint32_t sum = 0;
   for (int i = 0; i < m.window; i++) sum += m.recent[i];
+  if (count_stats && test_on && test_armed && static_cast<int32_t>(millis() - test_from) >= 0) {
+    test_peak = max(test_peak, static_cast<float>(sum) / (255.0f * m.window));
+  }
   if (sum >= static_cast<uint32_t>(m.cutoff) * m.window && static_cast<int32_t>(millis() - m.quiet_until) >= 0) {
     LOGI(TAG, "%s (average %u%%)", count_stats ? "wake word" : "stop", static_cast<unsigned>(sum * 100 / (255 * m.window)));
-    if (count_stats) snapshot_clip(static_cast<float>(sum) / (255.0f * m.window));
+    if (count_stats && test_on) {
+      test_end = min(test_end, millis() + 500);  // heard: finish once the word has ended
+    } else if (count_stats) {
+      Clip info;
+      info.probability = static_cast<float>(sum) / (255.0f * m.window);
+      snapshot(CLIP_SAMPLES, info);
+    }
     m.quiet_until = millis() + REFRACTORY_MS;
     memset(m.recent, 0, sizeof(m.recent));
     return true;
@@ -190,6 +242,12 @@ void task(void*) {
     if (!resumed && (!n || !on)) continue;
     xSemaphoreTake(lock, portMAX_DELAY);
     if (resumed) reset_stream();  // a fresh start after a pause: no stale audio
+    if (test_on && !test_armed && listening && model) {
+      if (!resumed) reset_stream();  // a test hears only what's said after it starts
+      test_armed = true;
+      test_from = millis() + WARM_UP_MS;
+      test_end = millis() + TEST_MS;
+    }
     if (listening && model) ring_add(buf, n / sizeof(int16_t));
     if (frontend_ok) {
       const int16_t* p = buf;
@@ -207,6 +265,16 @@ void task(void*) {
         }
         if (!read) break;
       }
+    }
+    if (test_on && test_armed && static_cast<int32_t>(millis() - test_end) >= 0) {
+      Clip info;
+      info.test = true;
+      info.probability = test_peak;
+      info.detected = model && test_peak * 255.0f >= model->cutoff;
+      snapshot(TEST_SAMPLES, info);
+      test_on = false;
+      LOGI(TAG, "wake word test: %s, highest %u%%", info.detected ? "heard" : "not heard",
+           static_cast<unsigned>(test_peak * 100));
     }
     xSemaphoreGive(lock);
   }
@@ -329,40 +397,53 @@ bool takeDetection() {
 }
 
 void setClips(bool on) {
-  if (on == (ring != nullptr) || !lock) return;
-  int16_t* r = nullptr;
-  int16_t* c = nullptr;
+  if (!lock || on == clips_wanted) return;
+  clips_wanted = on;
   if (on) {
-    r = static_cast<int16_t*>(heap_caps_malloc(CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
-    c = static_cast<int16_t*>(heap_caps_malloc(CLIP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
-    if (!r || !c) {
-      LOGW(TAG, "no memory for wake clips");
-      heap_caps_free(r);
-      heap_caps_free(c);
-      return;
-    }
+    if (alloc_buffers()) LOGI(TAG, "wake clips on");
+    else LOGW(TAG, "no memory for wake clips");
+    return;
   }
   xSemaphoreTake(lock, portMAX_DELAY);
-  std::swap(ring, r);
-  std::swap(clip, c);
-  ring_at = ring_filled = clip_len = 0;
+  if (ring && !test_on && !clip_len) free_buffers();  // otherwise once the test's clip is taken
   xSemaphoreGive(lock);
-  heap_caps_free(r);  // the old buffers, when turning off
-  heap_caps_free(c);
-  LOGI(TAG, "wake clips %s", on ? "on" : "off");
+  LOGI(TAG, "wake clips off");
 }
 
-size_t takeClip(int16_t* out, float* probability) {
-  if (!lock || !clip_len) return 0;  // called every loop: no lock unless there's a clip
+bool startTest() {
+  if (!lock || !model || !alloc_buffers()) return false;
   xSemaphoreTake(lock, portMAX_DELAY);
-  const size_t n = clip ? clip_len : 0;
-  if (n) {
-    memcpy(out, clip, n * sizeof(int16_t));
-    if (probability) *probability = clip_probability;
+  test_peak = 0;
+  test_armed = false;
+  clip_len = 0;  // an untaken wake clip would be overwritten anyway
+  test_on = true;
+  xSemaphoreGive(lock);
+  return true;
+}
+
+bool testing() { return test_on; }
+
+void cancelTest() {
+  if (!lock) return;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  test_on = false;
+  if (!clips_wanted && ring) free_buffers();
+  xSemaphoreGive(lock);
+}
+
+Clip takeClip(int16_t* out) {
+  Clip c;
+  if (!lock || !clip_len) return c;  // called every loop: no lock unless there's a clip
+  xSemaphoreTake(lock, portMAX_DELAY);
+  if (clip && clip_len) {
+    c = clip_info;
+    c.samples = clip_len;
+    memcpy(out, clip, c.samples * sizeof(int16_t));
     clip_len = 0;
   }
+  if (!clips_wanted && !test_on && ring) free_buffers();  // kept only for the test
   xSemaphoreGive(lock);
-  return n;
+  return c;
 }
 
 bool takeStop() {

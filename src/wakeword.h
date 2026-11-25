@@ -28,13 +28,29 @@ void feed(const int16_t* samples, size_t count);  // from the audio task; never 
 void setListening(bool on);  // pause (false) while the speaker is busy, so it doesn't wake itself up
 bool takeDetection();        // true once per detection
 
-// Wake clips: while on, the last CLIP_SAMPLES of audio the wake word heard are kept (in PSRAM), and copied at every
-// detection, so Harkenn can be sent what set it off (false wakes become training data).
+// Wake clips: while on, the last few seconds of audio the wake word heard are kept (in PSRAM), and the last
+// CLIP_SAMPLES are copied at every detection, so Harkenn can be sent what set it off (false wakes become training
+// data).
 constexpr size_t CLIP_SAMPLES = 3 * 16000;
 void setClips(bool on);
-// The newest clip not taken yet, into `out` (room for CLIP_SAMPLES), oldest sample first; its length in samples, or
-// 0 if there's none. `probability` gets the detection's averaged probability (0-1).
-size_t takeClip(int16_t* out, float* probability);
+
+// Wake word test: listens for TEST_MS from now (call it once any cue has finished playing) without counting as a
+// detection, and keeps what it heard (up to TEST_SAMPLES) with the highest averaged probability, for takeClip().
+// Stops early just after the wake word is heard. Works with clips off too (the buffers are kept only meanwhile).
+constexpr size_t TEST_SAMPLES = 4 * 16000;
+constexpr uint32_t TEST_MS = 4000;
+bool startTest();   // false if there's no model or no memory
+bool testing();     // started and not finished yet
+void cancelTest();  // gives up (no clip)
+
+struct Clip {
+  size_t samples = 0;     // 0: none
+  float probability = 0;  // a detection's averaged probability, or a test's highest (0-1)
+  bool test = false;      // from startTest()
+  bool detected = false;  // a test: the wake word would have woken the speaker
+};
+// The newest clip not taken yet, into `out` (room for TEST_SAMPLES), oldest sample first.
+Clip takeClip(int16_t* out);
 
 struct Stats {
   uint32_t inferences = 0;

@@ -38,7 +38,9 @@ supported.
 5. **Wake word.** The wake word model (microWakeWord, run with TensorFlow Lite Micro) listens on the speaker itself
    while it's idle; no audio leaves the speaker until it hears the word. Harkenn sends the model and its sensitivity
    in the config. While Harkenn keeps recordings, the speaker also sends the 3 seconds it heard up to each detection
-   (a *wake clip*, once it's idle again), so false wakes can be found and used to train the model.
+   (a *wake clip*, once it's idle again), so false wakes can be found and used to train the model. Harkenn's
+   `wake_test` command plays a cue, listens for 4 s without waking, plays whether it heard the word, and sends what it
+   heard (`wake_test`), so missed words can be trained on too.
 6. **Only the nearest answers.** When several speakers hear the wake word, the one that heard it loudest answers.
    Each chimes and listens at once and tells Harkenn how loud the word was; Harkenn tells the others to stand down,
    and they go quiet (Harkenn's `audio.wake_arbitration`, on by default).
