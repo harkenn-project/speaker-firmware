@@ -1789,7 +1789,8 @@ void update_wake_test(bool idle) {
       wake_test = WakeTest::Off;
       send_wake_test_error("no memory");
     }
-  } else if (wake_test == WakeTest::Cue && millis() - wake_test_at > 10000) {
+  } else if (wake_test == WakeTest::Cue && static_cast<int32_t>(millis() - wake_test_at) > 10000) {
+    // (signed: wake_test_at is still ahead while the cue plays)
     wake_test = WakeTest::Off;
     send_wake_test_error("busy");
   } else if (wake_test == WakeTest::Running && !wakeword::testing()) {
